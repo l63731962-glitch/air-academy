@@ -167,33 +167,57 @@ def hash_code(email, code):
 
 
 def send_code_email(email, code):
-    host = os.getenv("SMTP_HOST", "")
-    if not host:
-        if ENV == "production":
-            raise RuntimeError("SMTP is not configured")
-        print(f"\n{'=' * 44}\n  AIR ACADEMY LOGIN CODE for {email}: {code}\n{'=' * 44}\n", flush=True)
+    subject = f"{code} is your Air Academy sign-in code"
+    text = f"Your Air Academy sign-in code is {code}\n\nIt expires in 10 minutes. If you didn't ask for it, ignore this email."
+    html = (
+        '<div style="font-family:system-ui;background:#0D0E15;color:#E8ECF5;padding:32px;text-align:center">'
+        '<h2 style="color:#00F0FF;letter-spacing:3px">AIR ACADEMY</h2><p>Your sign-in code</p>'
+        f'<p style="font-size:38px;letter-spacing:10px;font-weight:700;color:#fff">{code}</p>'
+        "<p style=\"color:#8A93AD\">Expires in 10 minutes. If you didn't request it, ignore this email.</p></div>"
+    )
+
+    # 1) Mailjet HTTP API: works on hosts that block SMTP ports (e.g. Render free plan).
+    mj_key, mj_secret = os.getenv("MAILJET_API_KEY"), os.getenv("MAILJET_SECRET_KEY")
+    if mj_key and mj_secret:
+        sender = os.getenv("MAILJET_FROM", "")
+        if not sender:
+            raise RuntimeError("MAILJET_FROM (a verified sender address) is not set")
+        r = requests.post(
+            "https://api.mailjet.com/v3.1/send", auth=(mj_key, mj_secret), timeout=15,
+            json={"Messages": [{
+                "From": {"Email": sender, "Name": os.getenv("MAILJET_FROM_NAME", "Air Academy")},
+                "To": [{"Email": email}], "Subject": subject, "TextPart": text, "HTMLPart": html}]},
+        )
+        ok = r.status_code == 200 and all(m.get("Status") == "success" for m in (r.json().get("Messages") or [{}]))
+        if not ok:
+            raise RuntimeError(f"Mailjet rejected the email ({r.status_code}): {r.text[:300]}")
         return
-    msg = EmailMessage()
-    msg["Subject"] = f"{code} is your Air Academy sign-in code"
-    msg["From"] = os.getenv("SMTP_FROM", os.getenv("SMTP_USER", "no-reply@localhost"))
-    msg["To"] = email
-    msg.set_content(f"Your Air Academy sign-in code is {code}\n\nIt expires in 10 minutes. If you didn't ask for it, ignore this email.")
-    msg.add_alternative(
-        f"""<div style="font-family:system-ui;background:#0D0E15;color:#E8ECF5;padding:32px;text-align:center">
-        <h2 style="color:#00F0FF;letter-spacing:3px">AIR ACADEMY</h2><p>Your sign-in code</p>
-        <p style="font-size:38px;letter-spacing:10px;font-weight:700;color:#fff">{code}</p>
-        <p style="color:#8A93AD">Expires in 10 minutes. If you didn't request it, ignore this email.</p></div>""",
-        subtype="html")
-    port = int(os.getenv("SMTP_PORT", "587"))
-    if port == 465:
-        s = smtplib.SMTP_SSL(host, port, timeout=15)
-    else:
-        s = smtplib.SMTP(host, port, timeout=15)
-        s.starttls()
-    with s:
-        if os.getenv("SMTP_USER"):
-            s.login(os.getenv("SMTP_USER"), os.getenv("SMTP_PASS", ""))
-        s.send_message(msg)
+
+    # 2) Plain SMTP (needs a host that allows SMTP ports).
+    host = os.getenv("SMTP_HOST", "")
+    if host:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = os.getenv("SMTP_FROM", os.getenv("SMTP_USER", "no-reply@localhost"))
+        msg["To"] = email
+        msg.set_content(text)
+        msg.add_alternative(html, subtype="html")
+        port = int(os.getenv("SMTP_PORT", "587"))
+        if port == 465:
+            s = smtplib.SMTP_SSL(host, port, timeout=15)
+        else:
+            s = smtplib.SMTP(host, port, timeout=15)
+            s.starttls()
+        with s:
+            if os.getenv("SMTP_USER"):
+                s.login(os.getenv("SMTP_USER"), os.getenv("SMTP_PASS", ""))
+            s.send_message(msg)
+        return
+
+    # 3) Development fallback: print the code in the terminal / Render logs.
+    if ENV == "production":
+        raise RuntimeError("No email provider configured (set MAILJET_* or SMTP_*)")
+    print(f"\n{'=' * 44}\n  AIR ACADEMY LOGIN CODE for {email}: {code}\n{'=' * 44}\n", flush=True)
 
 
 @app.post("/api/auth/request-code")
