@@ -10,7 +10,7 @@ const LOCK = '<svg viewBox="0 0 24 24"><path d="M12 1a5 5 0 0 0-5 5v3H6a2 2 0 0 
 const CHECK = '<svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm-1.3 14.7-4-4 1.4-1.4 2.6 2.6 5.6-5.6 1.4 1.4-7 7z"/></svg>';
 
 // Single source of truth. Every view renders from this, so the UI updates without a reload.
-const S = { user: null, courses: [], openId: null, detail: null, paying: false, status: '', q: '', filter: 'all', view: 'course', lesson: null, ca: null, exam: null, cert: null };
+const S = { user: null, courses: [], openId: null, detail: null, paying: false, status: '', q: '', filter: 'all', view: 'course', lesson: null, ca: null, exam: null, cert: null, group: null, pending: 0, canCreate: false, joinCode: null, invite: null };
 const isOwned = (id) => !!S.user && S.user.enrolledCourses.includes(id);
 const MARK = '<svg class="mk" viewBox="0 0 32 32" aria-hidden="true"><path class="hx" d="M16 2l12 7v14l-12 7L4 23V9z"/><path class="sn" d="M9.5 21a6.5 6.5 0 0 1 13 0M7 21h18M16 9.5v2.5M9.5 12.5l1.8 1.8M22.5 12.5l-1.8 1.8"/></svg>';
 const HUES = { 'prompt-engineering': 275, animation: 330, 'cloud-computing': 200, 'web-development': 160,
@@ -40,19 +40,27 @@ function toast(msg, kind = 'ok') {
 }
 
 /* ───────────── Dashboard ───────────── */
+// What a locked class says on its card. Outside a class group everything shows its price.
+const accessLabel = (c) => ({ needs_request: 'Ask teacher', pending: 'Waiting', denied: 'Not allowed', later: 'Not yet' }[(c.access || {}).state] || money(PRICE));
+function classbarText() {
+  if (!S.group) return '';
+  const nx = S.group.steps.find((s) => !isOwned(s.id));
+  return nx ? `Next class: ${esc(nx.title)}` : 'You have finished every class in your group.';
+}
+
 function cardHTML(c, i, animate) {
   const open = isOwned(c.id), done = open ? c.doneCount || 0 : 0;
   const cover = c.coverImage ? `style="background-image:url('${esc(c.coverImage)}')"` : `style="--h:${HUES[c.id] ?? 220}"`;
   return `
   <button class="glass card ${open ? 'open' : ''} ${animate ? '' : 'still'}" style="--i:${i}" data-id="${esc(c.id)}"
           aria-label="${esc(c.title)}, ${open ? 'unlocked' : 'locked'}">
-    <div class="cover" ${cover}><span class="ico">${c.coverImage ? '' : ICONS[c.id] || '📘'}</span></div>
+    <div class="cover" ${cover}><span class="cno">Class ${c.classNo}</span>${c.step ? `<span class="cstep">Step ${c.step}</span>` : ''}<span class="ico">${c.coverImage ? '' : ICONS[c.id] || '📘'}</span></div>
     <div class="card-body">
       <h3>${esc(c.title)}</h3>
       <p class="blurb">${esc(c.description)}</p>
       <div class="foot">
         <span class="meta">${open ? `${done} of ${c.lessonsCount} lessons done` : `${c.lessonsCount} lessons`}</span>
-        <span class="chip">${open ? CHECK + 'Unlocked' : LOCK + money(PRICE)}</span>
+        <span class="chip">${open ? CHECK + 'Unlocked' : LOCK + accessLabel(c)}</span>
       </div>
       ${open ? `<div class="mini"><i style="width:${c.lessonsCount ? (done / c.lessonsCount) * 100 : 0}%"></i></div>` : ''}
     </div>
@@ -78,18 +86,19 @@ function renderDashboard(animate = true) {
   $('#app').innerHTML = `
   <header class="hero">
     <div class="hero-top"><span class="brandmark">${MARK}<b>${APP}</b></span><span class="spacer"></span>
-      <span class="badge"><i></i>Secure session</span><button class="ghost" id="ps">Project Studio</button><button class="ghost" id="out">Sign out</button></div>
+      <span class="badge"><i></i>Secure session</span>${S.canCreate ? `<button class="ghost" id="cg">Class groups${S.pending ? ` <b class="dot">${S.pending}</b>` : ''}</button>` : ''}<button class="ghost" id="ps">Project Studio</button><button class="ghost" id="out">Sign out</button></div>
     <div class="hero-body">
       <div>
         <p class="welcome">Welcome back, ${esc((S.user.fullName || S.user.email).split(' ')[0])}</p>
         <h1>Learn it.<br>Build it.<br>Ship it.</h1>
-        <p class="lede">Eight hands-on tracks. Pay once per track and keep it for life.</p>
+        <p class="lede">${S.group ? `Your group has ${S.group.steps.length} class${S.group.steps.length === 1 ? '' : 'es'}, unlocked one step at a time.` : 'Eight hands-on tracks. Pay once per track and keep it for life.'}</p>
       </div>
       <div class="ring" style="--p:${t ? Math.round((n / t) * 100) : 0}" role="img" aria-label="${n} of ${t} tracks unlocked">
         <div><strong>${n}</strong><span>of ${t} unlocked</span></div>
       </div>
     </div>
   </header>
+  ${S.group ? `<div class="classbar"><b>${esc(S.group.name)}</b><span>${classbarText()}</span></div>` : ''}
   <div class="toolbar">
     <input id="q" type="search" placeholder="Search tracks" aria-label="Search tracks" value="${esc(S.q)}">
     <div class="seg">${tabs.map(([f, l]) => `<button data-f="${f}" aria-pressed="${S.filter === f}">${l}</button>`).join('')}</div>
@@ -103,7 +112,8 @@ function renderDashboard(animate = true) {
     renderGrid();
   }));
   $('#ps').onclick = () => openStudio();
-  $('#out').onclick = async () => { try { await api('/api/auth/logout', { method: 'POST' }); } catch (_) {} S.user = null; S.courses = []; S.q = ''; S.filter = 'all'; renderLogin(); };
+  const cg = $('#cg'); if (cg) cg.onclick = () => openGroups();
+  $('#out').onclick = async () => { try { await api('/api/auth/logout', { method: 'POST' }); } catch (_) {} S.user = null; S.courses = []; S.q = ''; S.filter = 'all'; S.group = null; S.pending = 0; renderLogin(); };
 }
 
 /* ───────────── Course sheet + paywall ───────────── */
@@ -116,6 +126,7 @@ async function openCourse(id) {
   $('#sheet').hidden = false; document.body.classList.add('lock');
   renderSheet();
   if (isOwned(id)) { await loadDetail(id); renderSheet(); }
+  else { await refreshCourses().catch(() => {}); renderSheet(); }   // a teacher may have decided since the page loaded
 }
 async function loadDetail(id) {
   try { S.detail = await api('/api/courses/' + encodeURIComponent(id)); } catch (x) { toast(x.message, 'bad'); }
@@ -186,7 +197,7 @@ async function celebrate(course) {
   const pw = $('#pw'); if (pw) pw.classList.add('lift');
   S.paying = false; S.status = '';
   await new Promise((r) => setTimeout(r, 650));
-  renderSheet(); renderDashboard(false);
+  await refreshCourses().catch(() => {}); renderSheet(); renderDashboard(false);
   burst();
   toast('Payment verified. Course unlocked!');
 }
@@ -195,10 +206,22 @@ async function celebrate(course) {
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && S.openId) closeSheet(); });
 
 async function enter() {
-  const d = await api('/api/courses'); S.courses = d.courses;
+  if (S.joinCode) {          // arrived through a class invite link: join the group, then show the dashboard
+    try { const r = await post('/api/groups/join/' + encodeURIComponent(S.joinCode), {}); toast(`You joined ${r.group.name}.`); }
+    catch (x) { toast(x.message, 'bad'); }
+    S.joinCode = null; S.invite = null; history.replaceState(null, '', '/');
+  }
+  await refreshCourses();
   renderDashboard();
 }
 window.addEventListener('load', async function boot() {
+  const m = location.pathname.match(/^\/(join|admin)\/([\w-]+)\/?$/);
+  if (m && m[1] === 'admin') return renderAdmin(m[2]);       // the teacher's private page needs no sign-in
+  if (m) {
+    S.joinCode = m[2];
+    try { S.invite = (await api('/api/groups/join/' + encodeURIComponent(m[2]))).group; }
+    catch (x) { S.joinCode = null; history.replaceState(null, '', '/'); toast(x.message, 'bad'); }
+  }
   try { await syncMe(); if (!S.user) throw 0; await enter(); }
   catch (_) { S.user = null; renderLogin(); }
 });
