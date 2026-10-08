@@ -1,7 +1,6 @@
-"""Open Air Tech Space: Flask backend. Accounts (name, date of birth, gender, password) verified by email code (Mailjet first, Resend as backup), progress, quizzes, CA record, exams, certificates, project studio + Flutterwave paywall (3,500 NGN per course)."""
-import hashlib, hmac, json, logging, os, random, re, secrets, smtplib, sqlite3, time, uuid
+"""Open Air Tech Space: Flask backend. Accounts (name, date of birth, gender, password) verified by email code (sent through Resend), progress, quizzes, CA record, exams, certificates, project studio + Flutterwave paywall (3,500 NGN per course)."""
+import hashlib, hmac, json, logging, os, random, re, secrets, sqlite3, time, uuid
 from datetime import date, datetime, timezone
-from email.message import EmailMessage
 from functools import wraps
 
 import requests
@@ -196,51 +195,28 @@ def hash_code(email, code):
 
 
 APP_NAME = "Open Air Tech Space"
-EMAIL_TIMEOUT = 10   # seconds a provider gets before we fall back to the next one
+EMAIL_TIMEOUT = 10   # seconds Resend gets to answer
 
 
-def _send_smtp(to, subject, text, html):
-    """Mailjet SMTP relay (or any SMTP): SMTP_HOST=in-v3.mailjet.com, SMTP_USER=API key, SMTP_PASS=secret key."""
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = os.getenv("SMTP_FROM", os.getenv("SMTP_USER", "no-reply@localhost"))
-    msg["To"] = to
-    msg.set_content(text)
-    msg.add_alternative(html, subtype="html")
-    host, port = os.getenv("SMTP_HOST", ""), int(os.getenv("SMTP_PORT", "587"))
-    if port == 465:
-        s = smtplib.SMTP_SSL(host, port, timeout=EMAIL_TIMEOUT)
-    else:
-        s = smtplib.SMTP(host, port, timeout=EMAIL_TIMEOUT)
-        s.starttls()
-    with s:
-        if os.getenv("SMTP_USER"):
-            s.login(os.getenv("SMTP_USER"), os.getenv("SMTP_PASS", ""))
-        s.send_message(msg)
+def resend_ready():
+    return bool(os.getenv("RESEND_API_KEY") and os.getenv("RESEND_FROM"))
 
 
-def _send_resend(to, subject, text, html):
+def send_resend(to, subject, text, html):
     """Resend HTTP API. RESEND_FROM must be on a domain verified in Resend, e.g. 'Open Air Tech Space <no-reply@yourdomain.com>'."""
     r = requests.post("https://api.resend.com/emails",
                       headers={"Authorization": f"Bearer {os.getenv('RESEND_API_KEY')}", "User-Agent": "open-air-tech-space/1.0"},
                       json={"from": os.getenv("RESEND_FROM", ""), "to": [to], "subject": subject, "text": text, "html": html},
                       timeout=EMAIL_TIMEOUT)
-    r.raise_for_status()
-
-
-# name -> (is it configured?, sender). EMAIL_ORDER=smtp,resend means Mailjet first and Resend as the backup.
-EMAIL_PROVIDERS = {
-    "smtp": (lambda: bool(os.getenv("SMTP_HOST")), _send_smtp),
-    "resend": (lambda: bool(os.getenv("RESEND_API_KEY") and os.getenv("RESEND_FROM")), _send_resend),
-}
+    if not r.ok:
+        log.error("Resend rejected the email (HTTP %s): %s", r.status_code, r.text[:300])
+        r.raise_for_status()
 
 
 def send_code_email(email, code):
-    names = [n.strip() for n in os.getenv("EMAIL_ORDER", "smtp,resend").split(",")]
-    ready = [n for n in names if n in EMAIL_PROVIDERS and EMAIL_PROVIDERS[n][0]()]
-    if not ready:
+    if not resend_ready():
         if ENV == "production":
-            raise RuntimeError("No email provider is configured")
+            raise RuntimeError("RESEND_API_KEY and RESEND_FROM must be set in production")
         print(f"\n{'=' * 44}\n  {APP_NAME.upper()} LOGIN CODE for {email}: {code}\n{'=' * 44}\n", flush=True)
         return
     subject = f"{code} is your {APP_NAME} sign-in code"
@@ -252,13 +228,7 @@ def send_code_email(email, code):
         <div style="font-size:40px;font-weight:700;letter-spacing:10px;color:#fff;padding:14px 0 14px 10px;background:#0D0E15;border:1px solid #00F0FF;border-radius:14px">{code}</div>
         <p style="color:#8A93AD;font-size:13px;margin:20px 0 0">Expires in 10 minutes. If you didn't request it, you can ignore this email.</p>
       </div></div>"""
-    for name in ready:
-        try:
-            EMAIL_PROVIDERS[name][1](email, subject, text, html)
-            return
-        except Exception:
-            log.exception("email provider '%s' failed, trying the next one", name)
-    raise RuntimeError("all email providers failed")
+    send_resend(email, subject, text, html)
 
 
 @app.post("/api/auth/request-code")
