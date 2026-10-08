@@ -76,6 +76,19 @@ CREATE TABLE IF NOT EXISTS certificates(
   score INTEGER NOT NULL, issued_at TEXT NOT NULL, UNIQUE(uid, course_id));
 """
 
+GROUP_SCHEMA = """
+CREATE TABLE IF NOT EXISTS class_groups(
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, owner_uid TEXT NOT NULL, join_code TEXT NOT NULL UNIQUE,
+  admin_token TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS class_group_courses(
+  group_id TEXT NOT NULL, position INTEGER NOT NULL, course_id TEXT NOT NULL, PRIMARY KEY(group_id, position));
+CREATE TABLE IF NOT EXISTS class_group_members(
+  uid TEXT PRIMARY KEY, group_id TEXT NOT NULL, joined_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS purchase_requests(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, group_id TEXT NOT NULL, uid TEXT NOT NULL, course_id TEXT NOT NULL,
+  status TEXT NOT NULL, created_at TEXT NOT NULL, decided_at TEXT, UNIQUE(uid, course_id));
+"""
+
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -83,9 +96,11 @@ def now_iso():
 
 def init_db():
     con = sqlite3.connect(DB_PATH)
-    con.execute("PRAGMA journal_mode=WAL")
+    if os.getenv("SQLITE_WAL", "1") == "1":   # set SQLITE_WAL=0 on hosts where WAL misbehaves (one worker is fine without it)
+        con.execute("PRAGMA journal_mode=WAL")
     con.executescript(SCHEMA)
     con.executescript(EXTRA_SCHEMA)
+    con.executescript(GROUP_SCHEMA)
     have = {r[1] for r in con.execute("PRAGMA table_info(users)")}
     for col in ("full_name", "dob", "gender", "pw_hash"):   # older databases get the new account columns
         if col not in have:
@@ -398,10 +413,26 @@ def me():
 @app.get("/api/courses")
 @login_required
 def courses():
+    uid = g.user["uid"]
     rows = db().execute("SELECT * FROM courses ORDER BY title").fetchall()
+    num = {r["id"]: i + 1 for i, r in enumerate(rows)}   # Class 1, Class 2... follow the dashboard order
     counts = {r["course_id"]: r["c"] for r in db().execute(
-        "SELECT course_id, COUNT(*) c FROM progress WHERE uid=? GROUP BY course_id", (g.user["uid"],))}
-    return jsonify(courses=[course_json(r) | {"doneCount": counts.get(r["id"], 0)} for r in rows])
+        "SELECT course_id, COUNT(*) c FROM progress WHERE uid=? GROUP BY course_id", (uid,))}
+    grp, owned = group_of(uid), enrolled_ids(uid)
+    scheme = scheme_of(grp["id"]) if grp else []
+    if grp:   # a class group only sees its own classes, in the teacher's order (plus anything already bought)
+        by = {r["id"]: r for r in rows}
+        rows = [by[c] for c in scheme if c in by] + [r for r in rows if r["id"] in owned and r["id"] not in scheme]
+    out = []
+    for r in rows:
+        item = course_json(r) | {"doneCount": counts.get(r["id"], 0), "classNo": num[r["id"]], "access": purchase_access(uid, r["id"], grp, owned)}
+        if r["id"] in scheme:
+            item["step"] = scheme.index(r["id"]) + 1
+        out.append(item)
+    pending = db().execute("""SELECT COUNT(*) c FROM purchase_requests p JOIN class_groups c ON c.id=p.group_id
+                              WHERE c.owner_uid=? AND p.status='pending'""", (uid,)).fetchone()["c"]
+    return jsonify(courses=out, group=group_summary(grp) if grp else None, pending=pending,
+                   canCreate=not GROUP_CREATORS or g.user["email"] in GROUP_CREATORS)
 
 
 @app.get("/api/courses/<cid>")
@@ -472,6 +503,9 @@ def payment_init():
         return err("Course not found.", 404)
     if cid in enrolled_ids(g.user["uid"]):
         return err("You already own this course.", 409)
+    gate = purchase_access(g.user["uid"], cid)
+    if gate["state"] != "open":
+        return err(GATE_MESSAGES.get(gate["state"], "You cannot buy this class right now."), 403)
     if not FLW_PUBLIC:
         return err("Payments are not configured yet.", 503)
     tx_ref = f"OATS-{uuid.uuid4().hex}"   # unique per attempt
@@ -750,11 +784,226 @@ def project_generate():
     return jsonify(project=ai_project(cid, theme, level, base) or base, rubric=[{"item": i, "points": p} for i, p in RUBRIC])
 
 
+# ───────────────────────── Class groups ─────────────────────────
+# A teacher makes a group and picks the classes in order. Students join with the join link. Inside a group a student
+# can only buy the next class in the scheme, and every class after the first needs the teacher to say yes.
+GROUP_CREATORS = {e.strip().lower() for e in os.getenv("GROUP_CREATOR_EMAILS", "").split(",") if e.strip()}   # empty = any signed-in user
+GATE_MESSAGES = {
+    "outside": "This class is not part of your class group.",
+    "later": "Finish your earlier class first. Classes unlock one at a time.",
+    "needs_request": "Ask your teacher to allow this class first.",
+    "pending": "Your teacher has not decided yet. You will be able to unlock this class once it is allowed.",
+    "denied": "Your teacher has not allowed this class yet.",
+}
+
+
+def group_of(uid):
+    return db().execute("SELECT c.* FROM class_groups c JOIN class_group_members m ON m.group_id=c.id WHERE m.uid=?", (uid,)).fetchone()
+
+
+def scheme_of(gid):
+    return [r["course_id"] for r in db().execute("SELECT course_id FROM class_group_courses WHERE group_id=? ORDER BY position", (gid,))]
+
+
+def group_summary(grp):
+    titles = {r["id"]: r["title"] for r in db().execute("SELECT id, title FROM courses")}
+    return {"id": grp["id"], "name": grp["name"], "steps": [{"id": c, "title": titles.get(c, c)} for c in scheme_of(grp["id"])]}
+
+
+def group_links(grp):
+    base = (os.getenv("PUBLIC_URL") or request.host_url).rstrip("/")
+    return {"joinUrl": f"{base}/join/{grp['join_code']}", "adminUrl": f"{base}/admin/{grp['admin_token']}"}
+
+
+def purchase_access(uid, cid, grp=None, owned=None):
+    """Where a student stands on buying one class. People outside any group buy freely."""
+    grp = grp if grp is not None else group_of(uid)
+    if grp is None:
+        return {"state": "open"}
+    owned = owned if owned is not None else enrolled_ids(uid)
+    scheme = scheme_of(grp["id"])
+    if cid in owned:
+        return {"state": "owned"}
+    if cid not in scheme:
+        return {"state": "outside"}
+    todo = [c for c in scheme if c not in owned]
+    if todo[0] != cid:
+        return {"state": "later", "next": todo[0]}
+    if scheme[0] == cid:
+        return {"state": "open"}          # the first class needs no approval
+    r = db().execute("SELECT status FROM purchase_requests WHERE uid=? AND course_id=?", (uid, cid)).fetchone()
+    return {"state": {"allowed": "open", "pending": "pending", "denied": "denied"}.get(r["status"] if r else None, "needs_request")}
+
+
+def send_plain_email(to, subject, text, html):
+    """Best-effort notices. A failure here must never break the student's request."""
+    if not resend_ready():
+        print(f"\n[email to {to}] {subject}\n{text}\n", flush=True)
+        return
+    send_resend(to, subject, text, html)
+
+
+def notify_admin(grp, student, course_id):
+    owner = db().execute("SELECT email FROM users WHERE uid=?", (grp["owner_uid"],)).fetchone()
+    course = db().execute("SELECT title FROM courses WHERE id=?", (course_id,)).fetchone()
+    if not owner or not course:
+        return
+    who, link = student["full_name"] or student["email"], group_links(grp)["adminUrl"]
+    subject = f"{who} wants to unlock {course['title']}"
+    text = f"{who} ({student['email']}) in your group \"{grp['name']}\" asked to unlock {course['title']}.\n\nAllow or do not allow here:\n{link}"
+    html = (f'<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:24px;border:1px solid #2a2f55;border-radius:16px">'
+            f'<h2 style="margin:0 0 8px">{escape(who)} wants to unlock {escape(course["title"])}</h2>'
+            f'<p>Group: <b>{escape(grp["name"])}</b>. Student email: {escape(student["email"])}.</p>'
+            f'<p><a href="{escape(link)}" style="display:inline-block;padding:12px 22px;border-radius:12px;background:#00F0FF;color:#04121a;text-decoration:none;font-weight:700">Allow or do not allow</a></p></div>')
+    try:
+        send_plain_email(owner["email"], subject, text, html)
+    except Exception:
+        log.exception("could not email the class admin")
+
+
+@app.get("/api/groups/catalog")
+@login_required
+def group_catalog():
+    rows = db().execute("SELECT id, title FROM courses ORDER BY title").fetchall()
+    return jsonify(courses=[{"id": r["id"], "title": r["title"], "classNo": i + 1} for i, r in enumerate(rows)],
+                   canCreate=not GROUP_CREATORS or g.user["email"] in GROUP_CREATORS)
+
+
+@app.post("/api/groups")
+@login_required
+def group_create():
+    b = request.get_json(silent=True) or {}
+    name, ids = " ".join(str(b.get("name", "")).split()), b.get("courses")
+    if GROUP_CREATORS and g.user["email"] not in GROUP_CREATORS:
+        return err("Only approved teachers can create class groups.", 403)
+    if not 3 <= len(name) <= 60:
+        return err("Give the group a name of 3 to 60 characters.")
+    valid = {r["id"] for r in db().execute("SELECT id FROM courses")}
+    if not (isinstance(ids, list) and ids and all(isinstance(i, str) and i in valid for i in ids) and len(set(ids)) == len(ids)):
+        return err("Pick at least one class, each only once.")
+    gid = uuid.uuid4().hex
+    db().execute("INSERT INTO class_groups VALUES(?,?,?,?,?,?)", (gid, name, g.user["uid"], secrets.token_urlsafe(8), secrets.token_urlsafe(24), now_iso()))
+    for pos, cid in enumerate(ids):
+        db().execute("INSERT INTO class_group_courses VALUES(?,?,?)", (gid, pos, cid))
+    db().commit()
+    grp = db().execute("SELECT * FROM class_groups WHERE id=?", (gid,)).fetchone()
+    return jsonify(group=group_summary(grp) | group_links(grp))
+
+
+@app.get("/api/groups/mine")
+@login_required
+def group_mine():
+    out = []
+    for grp in db().execute("SELECT * FROM class_groups WHERE owner_uid=? ORDER BY created_at DESC", (g.user["uid"],)).fetchall():
+        n = db().execute("SELECT COUNT(*) c FROM class_group_members WHERE group_id=?", (grp["id"],)).fetchone()["c"]
+        p = db().execute("SELECT COUNT(*) c FROM purchase_requests WHERE group_id=? AND status='pending'", (grp["id"],)).fetchone()["c"]
+        out.append(group_summary(grp) | group_links(grp) | {"students": n, "pending": p})
+    return jsonify(groups=out)
+
+
+@app.get("/api/groups/join/<code>")
+def group_invite(code):
+    grp = db().execute("SELECT * FROM class_groups WHERE join_code=?", (code,)).fetchone()
+    return jsonify(group=group_summary(grp)) if grp else err("This invite link is not valid.", 404)
+
+
+@app.post("/api/groups/join/<code>")
+@login_required
+def group_join(code):
+    grp = db().execute("SELECT * FROM class_groups WHERE join_code=?", (code,)).fetchone()
+    if not grp:
+        return err("This invite link is not valid.", 404)
+    cur = group_of(g.user["uid"])
+    if cur and cur["id"] != grp["id"]:
+        return err("You are already in a class group. Ask your teacher if you need to move.", 409)
+    if not cur:
+        db().execute("INSERT INTO class_group_members VALUES(?,?,?)", (g.user["uid"], grp["id"], now_iso()))
+        db().commit()
+    return jsonify(group=group_summary(grp))
+
+
+@app.post("/api/groups/request")
+@login_required
+def group_request():
+    cid, uid = (request.get_json(silent=True) or {}).get("courseId"), g.user["uid"]
+    grp = group_of(uid)
+    if not grp:
+        return err("You are not in a class group.", 403)
+    if not isinstance(cid, str):
+        return err("Class not found.", 404)
+    state = purchase_access(uid, cid, grp)["state"]
+    if state not in ("needs_request", "denied", "pending"):
+        return err(GATE_MESSAGES.get(state, "You cannot ask for this class right now."), 403)
+    if state != "pending":    # asking again while waiting does not email the teacher twice
+        db().execute("""INSERT INTO purchase_requests(group_id,uid,course_id,status,created_at) VALUES(?,?,?,'pending',?)
+                        ON CONFLICT(uid, course_id) DO UPDATE SET status='pending', created_at=excluded.created_at, decided_at=NULL""",
+                     (grp["id"], uid, cid, now_iso()))
+        db().commit()
+        notify_admin(grp, g.user, cid)
+    return jsonify(access=purchase_access(uid, cid, grp))
+
+
+def admin_group(token):
+    return db().execute("SELECT * FROM class_groups WHERE admin_token=?", (token,)).fetchone()
+
+
+@app.get("/api/groups/admin/<token>")
+def admin_view(token):
+    grp = admin_group(token)
+    if not grp:
+        return err("This admin link is not valid.", 404)
+    steps, titles = scheme_of(grp["id"]), {r["id"]: r["title"] for r in db().execute("SELECT id, title FROM courses")}
+    reqs = db().execute("""SELECT r.id, r.status, r.created_at, r.decided_at, r.course_id, u.full_name, u.email FROM purchase_requests r
+                           JOIN users u ON u.uid=r.uid WHERE r.group_id=? ORDER BY (r.status='pending') DESC, r.created_at DESC""", (grp["id"],)).fetchall()
+    students = []
+    for m in db().execute("""SELECT u.uid, u.full_name, u.email, m.joined_at FROM class_group_members m JOIN users u ON u.uid=m.uid
+                             WHERE m.group_id=? ORDER BY m.joined_at""", (grp["id"],)).fetchall():
+        owned, classes = enrolled_ids(m["uid"]), []
+        for cid in steps:
+            if cid not in owned:
+                classes.append({"id": cid, "owned": False})
+                continue
+            rec = ca_record(m["uid"], cid) if CONTENT.get(cid) else None
+            classes.append({"id": cid, "owned": True, "done": len(done_list(m["uid"], cid)), "total": len(LESSONS.get(cid, [])),
+                            "score": {k: rec[k] for k in ("ca", "exam", "total", "passed")} if rec else None})
+        students.append({"uid": m["uid"], "name": m["full_name"] or m["email"], "email": m["email"], "joinedAt": m["joined_at"][:10], "classes": classes})
+    return jsonify(group=group_summary(grp) | group_links(grp), students=students,
+                   requests=[{"id": r["id"], "status": r["status"], "student": r["full_name"] or r["email"], "email": r["email"],
+                              "course": titles.get(r["course_id"], r["course_id"]), "at": r["created_at"][:16].replace("T", " ")} for r in reqs])
+
+
+@app.post("/api/groups/admin/<token>/requests/<int:rid>")
+def admin_decide(token, rid):
+    grp = admin_group(token)
+    if not grp:
+        return err("This admin link is not valid.", 404)
+    allow = (request.get_json(silent=True) or {}).get("allow")
+    if not isinstance(allow, bool):
+        return err("Choose allow or do not allow.")
+    cur = db().execute("UPDATE purchase_requests SET status=?, decided_at=? WHERE id=? AND group_id=?",
+                       ("allowed" if allow else "denied", now_iso(), rid, grp["id"]))
+    db().commit()
+    return jsonify(ok=True) if cur.rowcount else err("Request not found.", 404)
+
+
+@app.post("/api/groups/admin/<token>/students/<uid>/remove")
+def admin_remove(token, uid):
+    grp = admin_group(token)
+    if not grp:
+        return err("This admin link is not valid.", 404)
+    db().execute("DELETE FROM class_group_members WHERE uid=? AND group_id=?", (uid, grp["id"]))
+    db().execute("DELETE FROM purchase_requests WHERE uid=? AND group_id=?", (uid, grp["id"]))
+    db().commit()
+    return jsonify(ok=True)
+
+
 # ───────────────────────── Frontend ─────────────────────────
 
 
 @app.get("/")
-def index():
+@app.get("/join/<code>")
+@app.get("/admin/<token>")
+def index(**_):
     return send_from_directory("static", "index.html")
 
 
