@@ -1,5 +1,7 @@
 Flask>=3.0
 requests>=2.32
 python-dotenv>=1.0
+psycopg[binary]>=3.2
+psycopg-pool>=3.2
 gunicorn>=22.0; sys_platform != "win32"
 waitress>=3.0; sys_platform == "win32"
