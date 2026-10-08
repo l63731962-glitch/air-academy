@@ -49,6 +49,7 @@ function renderLogin(mode = 'signin', d = {}) {
   $('#app').innerHTML = `
   <section class="login"><div class="login-box">
     <div class="logo">${MARK}</div><h1>Open Air<br>Tech Space</h1><p class="sub">Learn tech skills. Build real projects.</p>
+    ${S.invite ? `<div class="invite"><b>You are invited to join ${esc(S.invite.name)}</b><span>Create an account or sign in and you will join automatically. Classes in this group: ${S.invite.steps.map((s) => esc(s.title)).join(', ')}.</span></div>` : ''}
     <form class="glass panel" id="f" novalidate>${forms[mode]}</form>
     <ul class="perks"><li>8 tracks</li><li>${money(PRICE)} once per track</li><li>Lifetime access</li></ul>
   </div></section>`;
@@ -112,6 +113,7 @@ const cap = (s) => s[0].toUpperCase() + s.slice(1);
 
 function renderSheet() {
   if (S.view === 'projects') return viewStudio();
+  if (S.view === 'groups') return viewGroups();
   const c = S.courses.find((x) => x.id === S.openId); if (!c) return;
   ({ course: viewCourse, lesson: viewLesson, ca: viewCA, exam: viewExam, cert: viewCert }[S.view] || viewCourse)(c);
 }
@@ -147,20 +149,15 @@ function viewCourse(c) {
   sheet(`
     <div class="glass intro"><h2>${esc(c.title)}</h2><p>${esc(c.description)}</p>
       ${ready && total ? `<div class="prog" id="prog"><i style="width:${(dn / total) * 100}%"></i></div><p class="meta" id="pt">${dn} of ${total} lessons done.</p>
-      <div class="pills"><button class="pill hot" id="ca">My CA and certificate</button><button class="pill" id="st">Project Studio</button>${L.some((l) => !l.deep) ? '<button class="pill" id="ex">Expand all lessons</button>' : ''}<button class="pill" id="cp">Copy outline</button><button class="pill" id="pr">Print or save as PDF</button></div>` : ''}</div>
+      <div class="pills"><button class="pill hot" id="ca">My CA and certificate</button><button class="pill" id="stu">Project Studio</button>${L.some((l) => !l.deep) ? '<button class="pill" id="ex">Expand all lessons</button>' : ''}<button class="pill" id="cp">Copy outline</button><button class="pill" id="pr">Print or save as PDF</button></div>` : ''}</div>
     <div class="wrap${open ? '' : ' locked'}">
       <div class="lessons">${rows}</div>
-      ${open ? '' : `
-      <div class="paywall" id="pw"><div class="glass pay-card">
-        <div class="lockorb">${LOCK}</div>
-        <h3>Premium course</h3><p>One-time payment. Lifetime access to all ${c.lessonsCount} lessons, quizzes, CA record and certificate.</p>
-        <button class="btn premium" id="buy">UNLOCK PREMIUM COURSE<small>Access for ${money(PRICE)}</small></button>
-        <div class="status" id="st2">${esc(S.status)}</div>
-        <div class="secure">🔒 Secured by Flutterwave</div>
-      </div></div>`}
+      ${open ? '' : payCard(c)}
     </div>`, closeSheet, '← All tracks');
 
   const sh = $('#sheet'), buy = $('#buy'); if (buy) { buy.onclick = () => unlock(c); setPaying(S.paying); }
+  const rq = $('#req'); if (rq) rq.onclick = () => requestAccess(c);
+  const ck = $('#chk2'); if (ck) ck.onclick = async () => { await refreshCourses().catch(() => {}); renderSheet(); };
   if (!ready) return;
   sh.querySelectorAll('.deep').forEach((b) => (b.onclick = () => openLesson(+b.dataset.n)));
   sh.querySelectorAll('.markdone').forEach((b) => (b.onclick = async () => {
@@ -171,7 +168,7 @@ function viewCourse(c) {
     $('#prog').firstElementChild.style.width = (k / total) * 100 + '%'; $('#pt').textContent = `${k} of ${total} lessons done.`;
   }));
   sh.querySelectorAll('.les textarea').forEach((t) => (t.oninput = () => { try { t.value ? localStorage.setItem(noteKey(t.dataset.n), t.value) : localStorage.removeItem(noteKey(t.dataset.n)); } catch (_) {} }));
-  $('#ca').onclick = openCA; $('#st').onclick = () => openStudio(c.id);
+  $('#ca').onclick = openCA; $('#stu').onclick = () => openStudio(c.id);
   const ex = $('#ex');
   if (ex) ex.onclick = () => { const ds = [...sh.querySelectorAll('.les')], o = ds.some((d) => !d.open); ds.forEach((d) => (d.open = o)); ex.textContent = o ? 'Collapse all lessons' : 'Expand all lessons'; };
   $('#cp').onclick = async () => {
@@ -398,4 +395,123 @@ function bindBrief(gen) {
     const t = `${p.title}\n\n${p.scenario}\n\nObjective: ${p.objective}\n\nRequirements:\n${p.requirements.map((r, i) => `${i + 1}. ${r}`).join('\n')}\n\nHand in:\n${p.deliverables.map((r) => `- ${r}`).join('\n')}`;
     try { await navigator.clipboard.writeText(t); toast('Brief copied.'); } catch (_) { toast('Copy is blocked here.', 'bad'); }
   };
+}
+
+/* ───────────── Class groups: student side ───────────── */
+async function refreshCourses() {
+  const d = await api('/api/courses'); S.courses = d.courses; S.group = d.group; S.pending = d.pending || 0; S.canCreate = !!d.canCreate;
+}
+
+// The card on a locked class. Inside a class group it explains whose turn it is and asks the teacher for permission.
+function payCard(c) {
+  const a = c.access || { state: 'open' }, nxt = a.next && (S.courses.find((x) => x.id === a.next) || {}).title;
+  const card = (title, text, btn, extra = '') => `<div class="paywall" id="pw"><div class="glass pay-card"><div class="lockorb">${LOCK}</div><h3>${title}</h3><p>${text}</p>${btn}<div class="status" id="st">${esc(S.status)}</div>${extra}</div></div>`;
+  if (a.state === 'later') return card('Not your turn yet', `Your class unlocks one step at a time. Finish ${nxt ? `<b>${esc(nxt)}</b>` : 'your earlier class'} first.`, '');
+  if (a.state === 'pending') return card('Waiting for your teacher', 'Your request was sent. This class opens for payment as soon as your teacher allows it.', '<button class="btn" id="chk2">CHECK AGAIN</button>');
+  if (a.state === 'denied') return card('Not allowed yet', 'Your teacher has not allowed this class yet. You can ask again.', '<button class="btn" id="req">ASK AGAIN</button>');
+  if (a.state === 'needs_request') return card('Ask your teacher', 'Your teacher approves each new class. Send a request, and when it is allowed you can unlock this class.', '<button class="btn premium" id="req">ASK MY TEACHER</button>');
+  return card('Premium course', `One-time payment. Lifetime access to all ${c.lessonsCount} lessons, quizzes, CA record and certificate.`,
+    `<button class="btn premium" id="buy">UNLOCK PREMIUM COURSE<small>Access for ${money(PRICE)}</small></button>`, '<div class="secure">🔒 Secured by Flutterwave</div>');
+}
+
+async function requestAccess(c) {
+  try { const r = await post('/api/groups/request', { courseId: c.id }); c.access = r.access; toast('Your teacher has been notified.'); }
+  catch (x) { toast(x.message, 'bad'); }
+  renderSheet();
+}
+
+/* ───────────── Class groups: teacher side ───────────── */
+S.groups = { catalog: [], canCreate: true, mine: [], pick: [], name: '', made: null, loaded: false };
+
+async function openGroups() {
+  S.openId = null; S.view = 'groups'; S.groups.loaded = false;
+  $('#sheet').hidden = false; document.body.classList.add('lock'); renderSheet();
+  try {
+    const [c, m] = await Promise.all([api('/api/groups/catalog'), api('/api/groups/mine')]);
+    Object.assign(S.groups, { catalog: c.courses, canCreate: c.canCreate, mine: m.groups, loaded: true });
+  } catch (x) { toast(x.message, 'bad'); }
+  if (S.view === 'groups') renderSheet();
+}
+
+const linkRow = (label, url) => `<div class="linkrow"><span>${label}</span><input readonly value="${esc(url)}" aria-label="${label}"><button type="button" class="pill" data-copy="${esc(url)}">Copy</button></div>`;
+function bindCopy(root) {
+  root.querySelectorAll('[data-copy]').forEach((b) => (b.onclick = async () => {
+    try { await navigator.clipboard.writeText(b.dataset.copy); toast('Link copied.'); } catch (_) { b.previousElementSibling.select(); toast('Press Ctrl+C to copy the selected link.'); }
+  }));
+}
+const stepChips = (steps) => `<ol class="steps">${steps.map((s) => `<li>${esc(s.title)}</li>`).join('')}</ol>`;
+
+function viewGroups() {
+  const G = S.groups, no = (id) => (G.catalog.find((c) => c.id === id) || {}).classNo;
+  const form = !G.loaded ? '<p class="meta" style="text-align:center;padding:30px 0">Loading…</p>' : !G.canCreate ? '<p class="empty">Only approved teachers can create class groups.</p>' : `
+    <div class="glass panel studio">
+      <label for="gname">Group name</label><input id="gname" maxlength="60" placeholder="Lagos evening class" value="${esc(G.name)}">
+      <label>Pick the classes in the order students must take them. Tap to add, tap again to remove.</label>
+      <div class="picks">${G.catalog.map((c) => { const i = G.pick.indexOf(c.id); return `<button type="button" class="pick" data-id="${esc(c.id)}" aria-pressed="${i >= 0}"><span class="ord">${i >= 0 ? i + 1 : ''}</span><span><small>Class ${c.classNo}</small>${esc(c.title)}</span></button>`; }).join('')}</div>
+      <p class="meta" id="order">${G.pick.length ? 'Order: ' + G.pick.map((id) => 'Class ' + no(id)).join(' → ') : 'No classes picked yet.'}</p>
+      <div class="pills"><button type="button" class="pill" id="pall">Pick all in order</button><button type="button" class="pill" id="pclr">Clear</button></div>
+      <p class="err" id="e"></p><button class="btn" id="mk">CREATE GROUP</button>
+    </div>`;
+  const made = G.made ? `<div class="glass intro made"><h3>Group created: ${esc(G.made.name)}</h3>
+      <p>Send the invite link to your students. Keep the admin link for yourself: anyone who has it can approve purchases and see your students.</p>
+      ${linkRow('Invite link', G.made.joinUrl)}${linkRow('Admin link', G.made.adminUrl)}${stepChips(G.made.steps)}
+      <div class="pills"><a class="pill hot" href="${esc(G.made.adminUrl)}" target="_blank" rel="noopener">Open admin page</a></div></div>` : '';
+  const mine = G.mine.length ? `<h3 class="sec">Your groups</h3>` + G.mine.map((m) => `<div class="glass intro mygroup"><h3>${esc(m.name)}</h3>
+      <p>${m.students} student${m.students === 1 ? '' : 's'}${m.pending ? `, <b class="waiting">${m.pending} waiting for your answer</b>` : ''}</p>${stepChips(m.steps)}
+      ${linkRow('Invite link', m.joinUrl)}${linkRow('Admin link', m.adminUrl)}<div class="pills"><a class="pill hot" href="${esc(m.adminUrl)}" target="_blank" rel="noopener">Open admin page</a></div></div>`).join('') : '';
+  sheet(`<div class="glass intro"><h2>Class groups</h2><p>Make a group for your students. They join with your invite link, can only buy the next class in your order, and you approve every new class after the first.</p></div>${form}${made}${mine}`, closeSheet, '← All tracks');
+  bindCopy($('#sheet'));
+  if (!G.loaded || !G.canCreate) return;
+  $('#gname').oninput = (ev) => { G.name = ev.target.value; };
+  $('#sheet').querySelectorAll('.pick').forEach((b) => (b.onclick = () => { const i = G.pick.indexOf(b.dataset.id); if (i >= 0) G.pick.splice(i, 1); else G.pick.push(b.dataset.id); renderSheet(); }));
+  $('#pall').onclick = () => { G.pick = G.catalog.map((c) => c.id); renderSheet(); };
+  $('#pclr').onclick = () => { G.pick = []; renderSheet(); };
+  $('#mk').onclick = async () => {
+    const e = $('#e'), b = $('#mk'); e.textContent = '';
+    if (G.name.trim().length < 3) { e.textContent = 'Give the group a name of at least 3 characters.'; return; }
+    if (!G.pick.length) { e.textContent = 'Pick at least one class.'; return; }
+    b.disabled = true; b.innerHTML = '<span class="spin"></span>';
+    try {
+      G.made = (await post('/api/groups', { name: G.name.trim(), courses: G.pick })).group;
+      G.mine = (await api('/api/groups/mine')).groups; G.name = ''; G.pick = []; renderSheet(); $('#sheet').scrollTop = 0;
+    } catch (x) { e.textContent = x.message; b.disabled = false; b.textContent = 'CREATE GROUP'; }
+  };
+}
+
+/* The teacher's private page. Opened from the admin link, it needs no sign-in. */
+async function renderAdmin(token) {
+  document.title = 'Class admin | ' + APP;
+  const load = async () => {
+    try { paintAdmin(token, await api('/api/groups/admin/' + encodeURIComponent(token))); }
+    catch (x) { $('#app').innerHTML = `<section class="login"><div class="login-box"><div class="logo">${MARK}</div><h1>Admin link<br>not valid</h1><p class="sub">${esc(x.message)}</p></div></section>`; }
+  };
+  await load(); setInterval(() => { if (!document.hidden) load(); }, 30000);
+}
+
+function paintAdmin(token, d) {
+  const g = d.group, waiting = d.requests.filter((r) => r.status === 'pending');
+  const tag = { pending: 'Waiting', allowed: 'Allowed', denied: 'Not allowed' };
+  $('#app').innerHTML = `<div class="admin">
+    <header class="hero"><div class="hero-top"><span class="brandmark">${MARK}<b>${APP}</b></span><span class="spacer"></span><span class="badge"><i></i>Class admin</span></div>
+      <div class="hero-body"><div><p class="welcome">Class group</p><h1 class="adminh">${esc(g.name)}</h1><p class="lede">Keep this page's link private. It lets you approve classes and see your students.</p></div></div></header>
+    <section class="glass intro"><h3>Invite students</h3><p>Students who open this link and sign in join your group automatically.</p>${linkRow('Invite link', g.joinUrl)}
+      <h3 class="sec">Class order</h3>${stepChips(g.steps)}</section>
+    <section class="glass intro"><h3>Requests ${waiting.length ? `<b class="waiting">${waiting.length} waiting</b>` : ''}</h3>
+      ${d.requests.length ? d.requests.map((r) => `<div class="reqrow ${r.status}"><div><b>${esc(r.student)}</b> wants to unlock <b>${esc(r.course)}</b><small>${esc(r.email)}, ${esc(r.at)}</small></div>
+        ${r.status === 'pending' ? `<div class="pills"><button class="pill hot" data-rid="${r.id}" data-allow="1">Allow</button><button class="pill" data-rid="${r.id}" data-allow="0">Do not allow</button></div>` : `<span class="tag ${r.status}">${tag[r.status]}</span>`}</div>`).join('') : '<p class="meta">No requests yet. When a student asks to unlock the next class, it appears here and you get an email.</p>'}</section>
+    <section class="glass intro"><h3>Students (${d.students.length})</h3>${d.students.length ? `<div class="tablewrap"><table><thead><tr><th>Student</th>${g.steps.map((s, i) => `<th>Step ${i + 1}: ${esc(s.title)}</th>`).join('')}<th></th></tr></thead><tbody>
+      ${d.students.map((s) => `<tr><td><b>${esc(s.name)}</b><br><small>${esc(s.email)}<br>Joined ${esc(s.joinedAt)}</small></td>${s.classes.map((c) => `<td>${c.owned ? `Unlocked<br><small>${c.done} of ${c.total} lessons${c.score ? `<br>CA ${c.score.ca}%, exam ${c.score.exam == null ? 'not taken' : c.score.exam + '%'}${c.score.passed ? ', passed' : ''}` : ''}</small>` : '<small>Not yet</small>'}</td>`).join('')}
+        <td><button class="pill" data-rm="${esc(s.uid)}" data-name="${esc(s.name)}">Remove</button></td></tr>`).join('')}</tbody></table></div>` : '<p class="meta">No students yet. Send them the invite link.</p>'}</section></div>`;
+  bindCopy($('#app'));
+  $('#app').querySelectorAll('[data-rid]').forEach((b) => (b.onclick = async () => {
+    b.disabled = true;
+    try { await post(`/api/groups/admin/${encodeURIComponent(token)}/requests/${b.dataset.rid}`, { allow: b.dataset.allow === '1' }); toast(b.dataset.allow === '1' ? 'Allowed. The student can now unlock it.' : 'Not allowed.'); }
+    catch (x) { toast(x.message, 'bad'); }
+    paintAdmin(token, await api('/api/groups/admin/' + encodeURIComponent(token)));
+  }));
+  $('#app').querySelectorAll('[data-rm]').forEach((b) => (b.onclick = async () => {
+    if (!confirm(`Remove ${b.dataset.name} from this group? They keep any classes they already bought, but are no longer limited to your class order.`)) return;
+    try { await post(`/api/groups/admin/${encodeURIComponent(token)}/students/${encodeURIComponent(b.dataset.rm)}/remove`, {}); } catch (x) { toast(x.message, 'bad'); }
+    paintAdmin(token, await api('/api/groups/admin/' + encodeURIComponent(token)));
+  }));
 }
