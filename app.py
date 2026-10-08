@@ -1,12 +1,15 @@
 """Open Air Tech Space: Flask backend. Accounts (name, date of birth, gender, password) verified by email code (sent through Resend), progress, quizzes, CA record, exams, certificates, project studio + Flutterwave paywall (3,500 NGN per course)."""
-import hashlib, hmac, json, logging, os, random, re, secrets, sqlite3, time, uuid
+import hashlib, hmac, json, logging, os, random, re, secrets, threading, time, uuid
 from datetime import date, datetime, timezone
 from functools import wraps
 
+import psycopg
 import requests
 from dotenv import load_dotenv
 from flask import Flask, g, jsonify, request, send_from_directory, session
 from markupsafe import escape
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from course_content import CONTENT, KINDS, RUBRIC, STEPS
@@ -15,7 +18,7 @@ from courses_seed import COURSES, LESSONS, NOTES
 load_dotenv()
 
 ENV = os.getenv("APP_ENV", "development")
-DB_PATH = os.getenv("DATABASE_PATH", "academy.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()   # Supabase: Connect > Session pooler connection string
 FLW_PUBLIC = os.getenv("FLW_PUBLIC_KEY", "")
 FLW_SECRET = os.getenv("FLW_SECRET_KEY", "")
 FLW_HASH = os.getenv("FLW_WEBHOOK_HASH", "")
@@ -43,10 +46,11 @@ app.config.update(
     MAX_CONTENT_LENGTH=64 * 1024,
 )
 
-# ───────────────────────── Database (SQLite) ─────────────────────────
+# ───────────────────────── Database (Postgres on Supabase) ─────────────────────────
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
-  uid TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
+  uid TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL,
+  full_name TEXT NOT NULL DEFAULT '', dob TEXT NOT NULL DEFAULT '', gender TEXT NOT NULL DEFAULT '', pw_hash TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS courses(
   id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL,
   cover_image TEXT NOT NULL DEFAULT '', lessons_count INTEGER NOT NULL);
@@ -55,8 +59,8 @@ CREATE TABLE IF NOT EXISTS enrollments(
   uid TEXT NOT NULL REFERENCES users(uid), course_id TEXT NOT NULL REFERENCES courses(id),
   created_at TEXT NOT NULL, PRIMARY KEY(uid, course_id));
 CREATE TABLE IF NOT EXISTS otp_codes(
-  email TEXT PRIMARY KEY, code_hash TEXT NOT NULL, expires_at INTEGER NOT NULL,
-  attempts INTEGER NOT NULL DEFAULT 0, sent_at INTEGER NOT NULL);
+  email TEXT PRIMARY KEY, code_hash TEXT NOT NULL, expires_at BIGINT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0, sent_at BIGINT NOT NULL);
 CREATE TABLE IF NOT EXISTS payments(
   tx_ref TEXT PRIMARY KEY, uid TEXT NOT NULL, course_id TEXT NOT NULL,
   amount INTEGER NOT NULL, currency TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
@@ -69,8 +73,9 @@ CREATE TABLE IF NOT EXISTS pending_signups(
 CREATE TABLE IF NOT EXISTS progress(
   uid TEXT NOT NULL, course_id TEXT NOT NULL, lesson_n INTEGER NOT NULL, done_at TEXT NOT NULL, PRIMARY KEY(uid, course_id, lesson_n));
 CREATE TABLE IF NOT EXISTS scores(
-  id INTEGER PRIMARY KEY AUTOINCREMENT, uid TEXT NOT NULL, course_id TEXT NOT NULL, kind TEXT NOT NULL,
+  id BIGSERIAL PRIMARY KEY, uid TEXT NOT NULL, course_id TEXT NOT NULL, kind TEXT NOT NULL,
   ref INTEGER NOT NULL DEFAULT 0, score INTEGER NOT NULL, max_score INTEGER NOT NULL, taken_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS scores_uid_course ON scores(uid, course_id);
 CREATE TABLE IF NOT EXISTS certificates(
   cert_id TEXT PRIMARY KEY, uid TEXT NOT NULL, course_id TEXT NOT NULL, full_name TEXT NOT NULL,
   score INTEGER NOT NULL, issued_at TEXT NOT NULL, UNIQUE(uid, course_id));
@@ -84,43 +89,93 @@ CREATE TABLE IF NOT EXISTS class_group_courses(
   group_id TEXT NOT NULL, position INTEGER NOT NULL, course_id TEXT NOT NULL, PRIMARY KEY(group_id, position));
 CREATE TABLE IF NOT EXISTS class_group_members(
   uid TEXT PRIMARY KEY, group_id TEXT NOT NULL, joined_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS class_group_members_group ON class_group_members(group_id);
 CREATE TABLE IF NOT EXISTS purchase_requests(
-  id INTEGER PRIMARY KEY AUTOINCREMENT, group_id TEXT NOT NULL, uid TEXT NOT NULL, course_id TEXT NOT NULL,
+  id BIGSERIAL PRIMARY KEY, group_id TEXT NOT NULL, uid TEXT NOT NULL, course_id TEXT NOT NULL,
   status TEXT NOT NULL, created_at TEXT NOT NULL, decided_at TEXT, UNIQUE(uid, course_id));
 """
+
+# Supabase publishes every table in the public schema through its REST API, which the public "anon" key can reach.
+# Row Level Security with no policies shuts that door. This app talks to Postgres directly as the owner role, which is unaffected.
+TABLES = ("users", "courses", "enrollments", "otp_codes", "payments", "pending_signups", "progress", "scores", "certificates",
+          "class_groups", "class_group_courses", "class_group_members", "purchase_requests")
 
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _dsn():
+    url = DATABASE_URL
+    if not url:
+        raise RuntimeError("DATABASE_URL is not set. Paste the Supabase 'Session pooler' connection string into it.")
+    url = re.sub(r"pgbouncer=[^&]*&?", "", url).rstrip("?&")   # a Prisma-style option Postgres drivers reject
+    if url.startswith("postgres") and "sslmode=" not in url and not re.search(r"@(localhost|127\.0\.0\.1|\[::1\])[:/]", url):
+        url += ("&" if "?" in url else "?") + "sslmode=require"   # Supabase only accepts encrypted connections
+    return url
+
+
+_pool, _pool_lock = None, threading.Lock()
+
+
+def pool():
+    """One small pool per server process, opened on first use (so it is created after gunicorn forks its workers)."""
+    global _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:
+                p = ConnectionPool(
+                    _dsn(), min_size=1, max_size=int(os.getenv("DB_POOL_MAX", "5")), open=False,
+                    # prepare_threshold=None: Supabase's pooler can hand each statement a different server connection,
+                    # so server-side prepared statements must stay off.
+                    kwargs={"row_factory": dict_row, "prepare_threshold": None},
+                    check=ConnectionPool.check_connection,   # drops a connection the pooler closed while it sat idle
+                    max_idle=300)
+                p.open(wait=True, timeout=30)
+                _pool = p
+    return _pool
+
+
+class Conn:
+    """Thin wrapper so the rest of this file keeps its `db().execute(sql, params).fetchone()` style with `?` placeholders."""
+
+    def __init__(self, raw):
+        self.raw = raw
+
+    def execute(self, sql, params=()):
+        return self.raw.execute(sql.replace("?", "%s"), params or None)
+
+    def commit(self):
+        self.raw.commit()
+
+    def rollback(self):
+        self.raw.rollback()
+
+    def transaction(self):
+        return self.raw.transaction()
+
+
 def init_db():
-    con = sqlite3.connect(DB_PATH)
-    if os.getenv("SQLITE_WAL", "1") == "1":   # set SQLITE_WAL=0 on hosts where WAL misbehaves (one worker is fine without it)
-        con.execute("PRAGMA journal_mode=WAL")
-    con.executescript(SCHEMA)
-    con.executescript(EXTRA_SCHEMA)
-    con.executescript(GROUP_SCHEMA)
-    have = {r[1] for r in con.execute("PRAGMA table_info(users)")}
-    for col in ("full_name", "dob", "gender", "pw_hash"):   # older databases get the new account columns
-        if col not in have:
-            con.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
-    for c in COURSES:
-        con.execute(
-            """INSERT INTO courses(id,title,description,lessons_count) VALUES(?,?,?,?)
-               ON CONFLICT(id) DO UPDATE SET title=excluded.title, description=excluded.description,
-               lessons_count=excluded.lessons_count""",
-            (c["id"], c["title"], c["description"], len(c["lessons"])),
-        )
-    con.commit()
-    con.close()
+    # A short-lived direct connection (not the pool), so importing this module never starts pool threads before a fork.
+    with psycopg.connect(_dsn(), prepare_threshold=None) as con:   # commits when the block ends cleanly, then closes
+        # Several workers boot at once. The lock makes them take turns creating tables (it frees itself at commit).
+        con.execute("SELECT pg_advisory_xact_lock(727401)")
+        for script in (SCHEMA, EXTRA_SCHEMA, GROUP_SCHEMA):
+            con.execute(script)
+        for t in TABLES:
+            con.execute(f"ALTER TABLE {t} ENABLE ROW LEVEL SECURITY")
+        for c in COURSES:
+            con.execute(
+                """INSERT INTO courses(id,title,description,lessons_count) VALUES(%s,%s,%s,%s)
+                   ON CONFLICT(id) DO UPDATE SET title=excluded.title, description=excluded.description,
+                   lessons_count=excluded.lessons_count""",
+                (c["id"], c["title"], c["description"], len(c["lessons"])),
+            )
 
 
 def db():
     if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH, timeout=10)
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA foreign_keys=ON")
+        g.db = Conn(pool().getconn())
     return g.db
 
 
@@ -128,7 +183,8 @@ def db():
 def close_db(_exc):
     d = g.pop("db", None)
     if d is not None:
-        d.close()
+        d.rollback()   # ends a read-only transaction cleanly; does nothing after a commit
+        pool().putconn(d.raw)
 
 
 init_db()
@@ -166,7 +222,7 @@ def login_required(fn):
 
 
 def enrolled_ids(uid):
-    rows = db().execute("SELECT course_id FROM enrollments WHERE uid=? ORDER BY created_at", (uid,))
+    rows = db().execute("SELECT course_id FROM enrollments WHERE uid=? ORDER BY created_at, course_id", (uid,))
     return [r["course_id"] for r in rows]
 
 
@@ -256,7 +312,9 @@ def request_code():
     if row and now - row["sent_at"] < RESEND_SECONDS:
         return err(f"Please wait {RESEND_SECONDS - (now - row['sent_at'])}s before requesting another code.", 429)
     code = f"{secrets.randbelow(10 ** 6):06d}"
-    db().execute("INSERT OR REPLACE INTO otp_codes(email,code_hash,expires_at,attempts,sent_at) VALUES(?,?,?,?,?)",
+    db().execute("INSERT INTO otp_codes(email,code_hash,expires_at,attempts,sent_at) VALUES(?,?,?,?,?) "
+                 "ON CONFLICT(email) DO UPDATE SET code_hash=excluded.code_hash, expires_at=excluded.expires_at, "
+                 "attempts=excluded.attempts, sent_at=excluded.sent_at",
                  (email, hash_code(email, code), now + OTP_TTL, 0, now))
     db().commit()
     try:
@@ -331,7 +389,9 @@ def register():
     if u and u["pw_hash"]:
         return err("An account with this email already exists. Sign in instead.", 409)
     # Details wait here until the email code proves the address is theirs; only then do they touch a real account.
-    db().execute("INSERT OR REPLACE INTO pending_signups VALUES(?,?,?,?,?,?)",
+    db().execute("INSERT INTO pending_signups(email,full_name,dob,gender,pw_hash,created_at) VALUES(?,?,?,?,?,?) "
+                 "ON CONFLICT(email) DO UPDATE SET full_name=excluded.full_name, dob=excluded.dob, gender=excluded.gender, "
+                 "pw_hash=excluded.pw_hash, created_at=excluded.created_at",
                  (email, name, dob.isoformat(), b["gender"], generate_password_hash(pw), now_iso()))
     db().commit()
     return request_code()
@@ -414,7 +474,7 @@ def me():
 @login_required
 def courses():
     uid = g.user["uid"]
-    rows = db().execute("SELECT * FROM courses ORDER BY title").fetchall()
+    rows = db().execute('SELECT * FROM courses ORDER BY title COLLATE "C"').fetchall()
     num = {r["id"]: i + 1 for i, r in enumerate(rows)}   # Class 1, Class 2... follow the dashboard order
     counts = {r["course_id"]: r["c"] for r in db().execute(
         "SELECT course_id, COUNT(*) c FROM progress WHERE uid=? GROUP BY course_id", (uid,))}
@@ -485,12 +545,14 @@ def fulfil(tx_ref, transaction_id):
         log.warning("payment rejected tx_ref=%s flw_status=%s", tx_ref, d.get("status"))
         return False, "Payment could not be verified.", 402
     try:
-        with con:   # atomic
+        with con.transaction():   # atomic: both writes happen or neither does
             con.execute("UPDATE payments SET status='verified', flw_transaction_id=?, verified_at=? "
                         "WHERE tx_ref=? AND status='pending'", (str(d["id"]), now_iso(), tx_ref))
-            con.execute("INSERT OR IGNORE INTO enrollments(uid,course_id,created_at) VALUES(?,?,?)",
+            con.execute("INSERT INTO enrollments(uid,course_id,created_at) VALUES(?,?,?) ON CONFLICT DO NOTHING",
                         (pay["uid"], pay["course_id"], now_iso()))
-    except sqlite3.IntegrityError:   # this Flutterwave transaction already paid for another reference
+        con.commit()
+    except psycopg.errors.IntegrityError:   # this Flutterwave transaction already paid for another reference
+        con.rollback()
         return False, "This transaction was already used.", 409
     return True, "Verified.", 200
 
@@ -567,7 +629,7 @@ def set_progress():
     if not isinstance(n, int) or not 1 <= n <= len(LESSONS.get(cid, [])):
         return err("Lesson not found.", 404)
     if b.get("done"):
-        db().execute("INSERT OR IGNORE INTO progress VALUES(?,?,?,?)", (g.user["uid"], cid, n, now_iso()))
+        db().execute("INSERT INTO progress(uid,course_id,lesson_n,done_at) VALUES(?,?,?,?) ON CONFLICT DO NOTHING", (g.user["uid"], cid, n, now_iso()))
     else:
         db().execute("DELETE FROM progress WHERE uid=? AND course_id=? AND lesson_n=?", (g.user["uid"], cid, n))
     db().commit()
@@ -662,7 +724,7 @@ def exam_submit(cid):
 
 def ca_record(uid, cid):
     """Continuous assessment: best score per lesson quiz (40%) + best exam (60%). Pass mark 50%."""
-    rows = db().execute("""SELECT kind, ref, MAX(CAST(score AS REAL) / max_score) pct, COUNT(*) tries FROM scores
+    rows = db().execute("""SELECT kind, ref, MAX(CAST(score AS DOUBLE PRECISION) / max_score) pct, COUNT(*) tries FROM scores
                            WHERE uid=? AND course_id=? GROUP BY kind, ref""", (uid, cid)).fetchall()
     quiz = {r["ref"]: r for r in rows if r["kind"] == "quiz"}
     exam = next((r for r in rows if r["kind"] == "exam"), None)
@@ -706,7 +768,7 @@ def certificate_issue(cid):
         return err(f"Pass the final exam with an overall score of {PASS_MARK}% or more to earn your certificate.", 403)
     if not g.user["full_name"]:
         return err("Your account has no full name yet. Create your account again with your full name to earn certificates.", 409)
-    db().execute("INSERT OR IGNORE INTO certificates VALUES(?,?,?,?,?,?)",
+    db().execute("INSERT INTO certificates(cert_id,uid,course_id,full_name,score,issued_at) VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING",
                  (f"OATS-{datetime.now().year}-{secrets.token_hex(4).upper()}", g.user["uid"], cid, g.user["full_name"], rec["total"], now_iso()))
     db().commit()
     cid_ = db().execute("SELECT cert_id FROM certificates WHERE uid=? AND course_id=?", (g.user["uid"], cid)).fetchone()["cert_id"]
@@ -864,7 +926,7 @@ def notify_admin(grp, student, course_id):
 @app.get("/api/groups/catalog")
 @login_required
 def group_catalog():
-    rows = db().execute("SELECT id, title FROM courses ORDER BY title").fetchall()
+    rows = db().execute('SELECT id, title FROM courses ORDER BY title COLLATE "C"').fetchall()
     return jsonify(courses=[{"id": r["id"], "title": r["title"], "classNo": i + 1} for i, r in enumerate(rows)],
                    canCreate=not GROUP_CREATORS or g.user["email"] in GROUP_CREATORS)
 
@@ -882,9 +944,9 @@ def group_create():
     if not (isinstance(ids, list) and ids and all(isinstance(i, str) and i in valid for i in ids) and len(set(ids)) == len(ids)):
         return err("Pick at least one class, each only once.")
     gid = uuid.uuid4().hex
-    db().execute("INSERT INTO class_groups VALUES(?,?,?,?,?,?)", (gid, name, g.user["uid"], secrets.token_urlsafe(8), secrets.token_urlsafe(24), now_iso()))
+    db().execute("INSERT INTO class_groups(id,name,owner_uid,join_code,admin_token,created_at) VALUES(?,?,?,?,?,?)", (gid, name, g.user["uid"], secrets.token_urlsafe(8), secrets.token_urlsafe(24), now_iso()))
     for pos, cid in enumerate(ids):
-        db().execute("INSERT INTO class_group_courses VALUES(?,?,?)", (gid, pos, cid))
+        db().execute("INSERT INTO class_group_courses(group_id,position,course_id) VALUES(?,?,?)", (gid, pos, cid))
     db().commit()
     grp = db().execute("SELECT * FROM class_groups WHERE id=?", (gid,)).fetchone()
     return jsonify(group=group_summary(grp) | group_links(grp))
@@ -917,7 +979,7 @@ def group_join(code):
     if cur and cur["id"] != grp["id"]:
         return err("You are already in a class group. Ask your teacher if you need to move.", 409)
     if not cur:
-        db().execute("INSERT INTO class_group_members VALUES(?,?,?)", (g.user["uid"], grp["id"], now_iso()))
+        db().execute("INSERT INTO class_group_members(uid,group_id,joined_at) VALUES(?,?,?)", (g.user["uid"], grp["id"], now_iso()))
         db().commit()
     return jsonify(group=group_summary(grp))
 
@@ -954,10 +1016,10 @@ def admin_view(token):
         return err("This admin link is not valid.", 404)
     steps, titles = scheme_of(grp["id"]), {r["id"]: r["title"] for r in db().execute("SELECT id, title FROM courses")}
     reqs = db().execute("""SELECT r.id, r.status, r.created_at, r.decided_at, r.course_id, u.full_name, u.email FROM purchase_requests r
-                           JOIN users u ON u.uid=r.uid WHERE r.group_id=? ORDER BY (r.status='pending') DESC, r.created_at DESC""", (grp["id"],)).fetchall()
+                           JOIN users u ON u.uid=r.uid WHERE r.group_id=? ORDER BY (r.status='pending') DESC, r.created_at DESC, r.id DESC""", (grp["id"],)).fetchall()
     students = []
     for m in db().execute("""SELECT u.uid, u.full_name, u.email, m.joined_at FROM class_group_members m JOIN users u ON u.uid=m.uid
-                             WHERE m.group_id=? ORDER BY m.joined_at""", (grp["id"],)).fetchall():
+                             WHERE m.group_id=? ORDER BY m.joined_at, u.uid""", (grp["id"],)).fetchall():
         owned, classes = enrolled_ids(m["uid"]), []
         for cid in steps:
             if cid not in owned:
