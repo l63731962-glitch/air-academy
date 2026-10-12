@@ -8,11 +8,16 @@ const post = (url, body) => api(url, { method: 'POST', body });
 const EMAIL_RX = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 
 /* ───────────── Text helpers ───────────── */
-const fmt = (s) => esc(s).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+const fmt = (s) => esc(s).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/`([^`]+?)`/g, '<code>$1</code>');
 function rich(t) {
   return t.split(/\n{2,}/).map((blk) => {
     const L = blk.split('\n');
-    if (L.every((l) => l.startsWith('> '))) return `<div class="pbox"><small>Example prompt</small>${L.map((l) => fmt(l.slice(2))).join('<br>')}</div>`;
+    if (L.every((l) => l === '>' || l.startsWith('> '))) {   // optional first line "> [Label]" names the box; code-like labels get a monospace box
+      const m = /^\[(.{1,28})\]$/.exec(L[0].slice(2).trim()), label = m ? m[1] : 'Example prompt', rest = m ? L.slice(1) : L;
+      if (m && /^(code|html|css|js|javascript|python|sql|json|terminal|command|config|dart|gdscript|http|bash|yaml|folder)/i.test(m[1]))
+        return `<div class="pbox code"><small>${esc(label)}</small><pre>${rest.map((l) => esc(l.slice(2))).join('\n')}</pre></div>`;
+      return `<div class="pbox"><small>${esc(label)}</small>${rest.map((l) => fmt(l.slice(2))).join('<br>')}</div>`;
+    }
     if (L.every((l) => l.startsWith('- '))) return `<ul>${L.map((l) => `<li>${fmt(l.slice(2))}</li>`).join('')}</ul>`;
     if (L.every((l) => /^\d+\. /.test(l))) return `<ol>${L.map((l) => `<li>${fmt(l.replace(/^\d+\. /, ''))}</li>`).join('')}</ol>`;
     return `<p>${L.map(fmt).join('<br>')}</p>`;
