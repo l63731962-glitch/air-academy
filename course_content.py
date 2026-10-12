@@ -202,3 +202,13 @@ RUBRIC = [("Meets the brief", 30), ("Quality of the work", 25), ("Testing and im
 
 from lessons_prompt_engineering import LESSONS as _PE   # noqa: E402  lessons 3 to 8
 CONTENT["prompt-engineering"].update(_PE)
+
+# The other seven courses: one lessons file each, same page format as prompt engineering.
+import lessons_animation, lessons_cloud, lessons_web, lessons_app, lessons_fullstack, lessons_agentic, lessons_game   # noqa: E402
+CONTENT["animation"] = lessons_animation.LESSONS
+CONTENT["cloud-computing"] = lessons_cloud.LESSONS
+CONTENT["web-development"] = lessons_web.LESSONS
+CONTENT["app-development"] = lessons_app.LESSONS
+CONTENT["full-stack"] = lessons_fullstack.LESSONS
+CONTENT["agentic-ai"] = lessons_agentic.LESSONS
+CONTENT["game-development"] = lessons_game.LESSONS
