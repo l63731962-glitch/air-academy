@@ -209,6 +209,21 @@ def current_user():
     return db().execute("SELECT * FROM users WHERE uid=?", (uid,)).fetchone()
 
 
+# Accounts that get every course free (teachers, staff, sponsored students): full email addresses in .env,
+# separated by commas. The email-code step at sign-up still proves the address belongs to the person.
+FREE_ACCESS = {e.strip().lower() for e in os.getenv("FREE_ACCESS_EMAILS", "").split(",") if e.strip()}
+
+
+def grant_free_access(u):
+    """Enrol a free-access account in every course. Safe to repeat, and it also picks up courses added later."""
+    if u["email"] in FREE_ACCESS:
+        added = db().execute(
+            "INSERT INTO enrollments(uid,course_id,created_at) SELECT ?::text, id, ?::text FROM courses ON CONFLICT DO NOTHING",
+            (u["uid"], now_iso())).rowcount
+        if added:
+            db().commit()
+
+
 def login_required(fn):
     @wraps(fn)
     def wrapper(*a, **kw):
@@ -216,6 +231,7 @@ def login_required(fn):
         if u is None:
             session.clear()
             return err("Please sign in.", 401)
+        grant_free_access(u)
         g.user = u
         return fn(*a, **kw)
     return wrapper
@@ -349,6 +365,7 @@ def consume_code(email, code):
 
 
 def start_session(u):
+    grant_free_access(u)
     session.clear()
     session["uid"] = u["uid"]
     session.permanent = True
