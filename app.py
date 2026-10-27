@@ -1,6 +1,6 @@
 """Open Air Tech Space: Flask backend. Accounts (name, date of birth, gender, password) verified by email code (sent through Resend), progress, quizzes, CA record, exams, certificates, project studio + Flutterwave paywall (3,500 NGN per course)."""
 import hashlib, hmac, json, logging, os, random, re, secrets, threading, time, uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from functools import wraps
 
 import psycopg
@@ -79,6 +79,10 @@ CREATE INDEX IF NOT EXISTS scores_uid_course ON scores(uid, course_id);
 CREATE TABLE IF NOT EXISTS certificates(
   cert_id TEXT PRIMARY KEY, uid TEXT NOT NULL, course_id TEXT NOT NULL, full_name TEXT NOT NULL,
   score INTEGER NOT NULL, issued_at TEXT NOT NULL, UNIQUE(uid, course_id));
+-- The AI-made extras on a lesson page. One row per extra; content stays '' while it is still being made.
+CREATE TABLE IF NOT EXISTS lesson_fresh(
+  uid TEXT NOT NULL, course_id TEXT NOT NULL, lesson_n INTEGER NOT NULL, seq INTEGER NOT NULL,
+  content TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, PRIMARY KEY(uid, course_id, lesson_n, seq));
 """
 
 GROUP_SCHEMA = """
@@ -98,7 +102,7 @@ CREATE TABLE IF NOT EXISTS purchase_requests(
 # Supabase publishes every table in the public schema through its REST API, which the public "anon" key can reach.
 # Row Level Security with no policies shuts that door. This app talks to Postgres directly as the owner role, which is unaffected.
 TABLES = ("users", "courses", "enrollments", "otp_codes", "payments", "pending_signups", "progress", "scores", "certificates",
-          "class_groups", "class_group_courses", "class_group_members", "purchase_requests")
+          "class_groups", "class_group_courses", "class_group_members", "purchase_requests", "lesson_fresh")
 
 
 def now_iso():
@@ -672,7 +676,8 @@ def lesson_page(cid, n):
         return err("This lesson page is being prepared.", 404)
     out = {k: c[k] for k in ("minutes", "hook", "sections", "diagram", "caption", "terms", "mistakes")}
     return jsonify(out | {"n": n, "title": LESSONS[cid][n - 1], "activity": lesson_json(cid, n - 1, "")["activity"], "quiz": [{"q": q["q"], "o": q["o"]} for q in c["quiz"]],
-                          "best": best_quiz(g.user["uid"], cid, n), "next": (n + 1) in CONTENT[cid]})
+                          "best": best_quiz(g.user["uid"], cid, n), "next": (n + 1) in CONTENT[cid],
+                          "fresh": fresh_of(g.user["uid"], cid, n), "freshOn": bool(os.getenv("OPENAI_API_KEY"))})
 
 
 def grade(qs, answers):
@@ -807,6 +812,94 @@ def verify_page(cert_id):
     return (f'<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Certificate check</title>'
             f'<body style="font:16px/1.6 system-ui,sans-serif;background:#0D0E15;color:#E8ECF5;max-width:560px;margin:12vh auto;padding:0 20px">'
             f'<div style="border:1px solid #00F0FF;border-radius:20px;padding:28px">{body}<p style="color:#8A93AD">{APP_NAME}</p></div>')
+
+
+# ───────────────────────── Fresh extras on lesson pages (OpenAI) ─────────────────────────
+# Each lesson page lets a student ask the AI for a new example and a new practice task, so a lesson never feels stale.
+# The cap is per student, per lesson page (default 3, change it with LESSON_FRESH_LIMIT). Every extra is saved,
+# so reopening the lesson shows them again without using up a turn.
+FRESH_LIMIT = int(os.getenv("LESSON_FRESH_LIMIT", "3"))
+FRESH_ANGLES = (   # a different angle each turn, so the three extras do not repeat each other
+    "an everyday situation in Nigerian life (home, market, school, church, transport or football)",
+    "a small business or workplace situation where this idea saves time or money",
+    "a problem-solving challenge: something goes wrong and the student has to use this lesson to fix it",
+)
+FRESH_STALE_SECONDS = 120   # a half-made extra older than this was abandoned (server restart, timeout) and is cleared
+
+
+def fresh_of(uid, cid, n):
+    rows = db().execute("SELECT content FROM lesson_fresh WHERE uid=? AND course_id=? AND lesson_n=? AND content<>'' ORDER BY seq",
+                        (uid, cid, n)).fetchall()
+    return {"limit": FRESH_LIMIT, "items": [json.loads(r["content"]) for r in rows]}
+
+
+def ai_fresh(cid, n, seq, earlier):
+    """Ask OpenAI for one new example + practice task for this lesson. Returns a cleaned dict, or None on any failure."""
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        return None
+    try:
+        page, course = CONTENT[cid][n], db().execute("SELECT title FROM courses WHERE id=?", (cid,)).fetchone()["title"]
+        ideas = "; ".join(h for h, _ in page["sections"])
+        terms = "; ".join(t for t, _ in page["terms"])
+        avoid = f" Do not reuse these earlier extras: {'; '.join(earlier)}." if earlier else ""
+        r = requests.post("https://api.openai.com/v1/chat/completions", headers={"Authorization": f"Bearer {key}"}, timeout=40, json={
+            "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"), "response_format": {"type": "json_object"}, "temperature": 0.9,
+            "messages": [
+                {"role": "system", "content": "You write short, fresh teaching extras for beginners in Nigeria. Reply with one JSON object only. "
+                 "Plain English a beginner can follow. Explain any technical word you use. No markdown headings."},
+                {"role": "user", "content": f"Course: {course}. Lesson {n}: {LESSONS[cid][n - 1]}. Main ideas: {ideas}. Key terms: {terms}. "
+                 f"Write one NEW extra for this lesson built around {FRESH_ANGLES[(seq - 1) % len(FRESH_ANGLES)]}. "
+                 f"It must teach the same ideas as the lesson and must not contradict it.{avoid} "
+                 "JSON keys, all strings: title (at most 8 words), example (80 to 140 words: a concrete story or worked example), "
+                 "task (one hands-on practice task doable in 10 minutes with free tools or just paper, at most 50 words), "
+                 "question (one question that checks understanding), answer (the answer in one or two sentences)."}]})
+        r.raise_for_status()
+        d = json.loads(r.json()["choices"][0]["message"]["content"])
+        out = {k: " ".join(str(d[k]).split())[:cap] if k == "example" else str(d[k]).strip()[:cap]
+               for k, cap in (("title", 90), ("example", 1100), ("task", 400), ("question", 300), ("answer", 400))}
+        return out if all(out.values()) else None
+    except Exception:
+        log.exception("AI lesson extra failed")
+        return None
+
+
+@app.post("/api/courses/<cid>/lessons/<int:n>/fresh")
+@login_required
+def lesson_fresh(cid, n):
+    bad = locked_error(cid)
+    if bad:
+        return bad
+    if not CONTENT.get(cid, {}).get(n):
+        return err("This lesson page is being prepared.", 404)
+    if not os.getenv("OPENAI_API_KEY"):
+        return err("New examples are not switched on yet.", 503)
+    uid, con = g.user["uid"], db()
+    stale = (datetime.now(timezone.utc) - timedelta(seconds=FRESH_STALE_SECONDS)).isoformat(timespec="seconds")
+    con.execute("DELETE FROM lesson_fresh WHERE uid=? AND course_id=? AND lesson_n=? AND content='' AND created_at<?", (uid, cid, n, stale))
+    rows = con.execute("SELECT seq, content FROM lesson_fresh WHERE uid=? AND course_id=? AND lesson_n=? ORDER BY seq", (uid, cid, n)).fetchall()
+    done = [r for r in rows if r["content"]]
+    if len(done) != len(rows):
+        con.commit()
+        return err("Your last one is still being made. Give it a moment.", 409)
+    if len(done) >= FRESH_LIMIT:
+        con.commit()
+        return err(f"You have used all {FRESH_LIMIT} new examples for this lesson.", 403)
+    seq = len(done) + 1
+    try:   # reserve the turn before the slow AI call, so two quick taps can never spend more than the limit
+        con.execute("INSERT INTO lesson_fresh(uid,course_id,lesson_n,seq,created_at) VALUES(?,?,?,?,?)", (uid, cid, n, seq, now_iso()))
+        con.commit()
+    except psycopg.errors.IntegrityError:
+        con.rollback()
+        return err("Your last one is still being made. Give it a moment.", 409)
+    item = ai_fresh(cid, n, seq, [json.loads(r["content"])["title"] for r in done])
+    if item is None:   # a failed attempt hands the turn back
+        con.execute("DELETE FROM lesson_fresh WHERE uid=? AND course_id=? AND lesson_n=? AND seq=?", (uid, cid, n, seq))
+        con.commit()
+        return err("Could not make a new one right now. That did not use up one of your turns. Please try again.", 502)
+    con.execute("UPDATE lesson_fresh SET content=? WHERE uid=? AND course_id=? AND lesson_n=? AND seq=?", (json.dumps(item), uid, cid, n, seq))
+    con.commit()
+    return jsonify(fresh=fresh_of(uid, cid, n))
 
 
 # ───────────────────────── Project studio ─────────────────────────
