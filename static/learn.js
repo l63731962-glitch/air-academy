@@ -217,6 +217,39 @@ function bindQuiz(c) {
   if (rt) rt.onclick = () => { l.result = null; q.innerHTML = quizHTML(l); bindQuiz(c); q.scrollIntoView({ behavior: 'smooth', block: 'start' }); };
 }
 
+/* ───────────── Fresh extras: a new example + task from the AI, a few times per lesson ───────────── */
+function freshHTML(l) {
+  const f = l.fresh;
+  if (!f || (!l.freshOn && !f.items.length)) return '';
+  const left = f.limit - f.items.length;
+  const card = (it, i) => `<article class="fx"><small>Fresh ${i + 1} of ${f.limit}</small><h4>${fmt(it.title)}</h4>${rich(it.example)}
+    <div class="fx-task"><b>Try it</b><p>${fmt(it.task)}</p></div>
+    <details><summary>${fmt(it.question)}</summary><p>${fmt(it.answer)}</p></details></article>`;
+  return `<section class="fresh" id="fresh"><h3>Want it a different way?</h3>
+    <p class="meta">Get a brand new example and a new practice task for this lesson. You can do this ${f.limit} times on each lesson, so pick your moments.</p>
+    ${f.items.map(card).join('')}
+    ${left > 0 ? `<p class="err" id="fx-e"></p><div class="pills"><button class="pill hot" id="fx-go">${f.items.length ? 'Another new example' : 'Show me a new example'} (${left} left)</button></div>`
+      : `<p class="meta fx-done">You have used all ${f.limit} for this lesson. The next lesson has its own ${f.limit}.</p>`}
+  </section>`;
+}
+
+function bindFresh(c) {
+  const l = S.lesson, go = $('#fx-go');
+  if (!go) return;
+  go.onclick = async () => {
+    const label = go.textContent;
+    go.disabled = true; go.innerHTML = '<span class="spin"></span> Making a new one…'; $('#fx-e').textContent = '';
+    try {
+      l.fresh = (await post(`/api/courses/${encodeURIComponent(c.id)}/lessons/${l.n}/fresh`, {})).fresh;
+      $('#fresh').outerHTML = freshHTML(l); bindFresh(c);
+      const cards = document.querySelectorAll('#fresh .fx'); if (cards.length) cards[cards.length - 1].scrollIntoView({ behavior: 'smooth', block: 'center' });
+    } catch (x) {
+      if (x.status === 403) { await openLesson(l.n); return; }   // all used up elsewhere: refresh the page state
+      $('#fx-e').textContent = x.message; go.disabled = false; go.textContent = label;
+    }
+  };
+}
+
 function viewLesson(c) {
   const l = S.lesson, total = S.detail.lessons.length, done = S.detail.done.includes(l.n);
   sheet(`
@@ -229,12 +262,13 @@ function viewLesson(c) {
     <section class="terms"><h3>Key terms</h3><dl>${l.terms.map(([t, d]) => `<dt>${esc(t)}</dt><dd>${esc(d)}</dd>`).join('')}</dl></section>
     <section class="oops"><h3>Common mistakes to avoid</h3><ul>${l.mistakes.map((m) => `<li>${esc(m)}</li>`).join('')}</ul></section>
     ${l.activity ? `<section><div class="act"><h4>Try it yourself</h4><p>${esc(l.activity)}</p></div></section>` : ''}
+    ${freshHTML(l)}
     <section class="quiz" id="quiz">${quizHTML(l)}</section>
     <section><h3>Your notes</h3><textarea id="mynote" placeholder="What you learned, questions to ask, ideas for your project"></textarea><p class="meta">Saved on this device.</p></section>
     <div class="pills"><button class="pill markdone" id="md" aria-pressed="${done}">${done ? 'Marked as done' : 'Mark lesson as done'}</button>
       ${l.next ? '<button class="pill hot" id="nx">Next lesson</button>' : ''}<button class="pill" id="ca2">My CA and certificate</button></div>
   </article>`, () => goView('course'), '← Back to lessons');
-  bindQuiz(c);
+  bindQuiz(c); bindFresh(c);
   const nk = `oats:note:${S.user.uid}:${c.id}:${l.n}`, nt = $('#mynote');
   try { nt.value = localStorage.getItem(nk) || ''; } catch (_) {}
   nt.oninput = () => { try { nt.value ? localStorage.setItem(nk, nt.value) : localStorage.removeItem(nk); } catch (_) {} };
