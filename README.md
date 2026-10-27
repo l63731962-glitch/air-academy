@@ -19,8 +19,9 @@ Open http://127.0.0.1:5000
 - `FLW_PUBLIC_KEY` / `FLW_SECRET_KEY`: Flutterwave dashboard > Settings > API keys. Use the TEST keys first.
 - `SMTP_*`: your email provider. Leave `SMTP_HOST` empty in development and the 6-digit code prints in the terminal instead.
 - `FREE_ACCESS_EMAILS`: optional, comma-separated full email addresses that get every course free (enrolled automatically at sign-in, including courses added later).
-- `OPENAI_API_KEY` (and optional `OPENAI_MODEL`, default `gpt-4o-mini`): powers the project generator and the "new example" button on lesson pages.
-- `LESSON_FRESH_LIMIT`: optional, how many AI-made examples each student can get per lesson page (default 3).
+- `OPENAI_API_KEY`: powers the project generator and the picture maker on lesson pages. `OPENAI_MODEL` (default `gpt-4o-mini`) is used to check that a picture prompt is connected to the lesson.
+- Picture maker (all optional): `OPENAI_IMAGE_MODEL` (default `gpt-image-2`), `IMAGE_QUALITY` (`low`, `medium` or `high`, default `medium`; this is the main cost setting), `LESSON_IMAGE_LIMIT` (pictures per student per lesson page, default 3), `IMAGE_BLOCK_MINUTES` (pause after an off-topic prompt, default 30), `IMAGE_MAX_PARALLEL` (pictures being made at once across all students, default 4).
+  To lift a block early, delete that student's row from the `image_blocks` table in Supabase.
 - `FLW_WEBHOOK_HASH`: any random string; put the same value as "Secret hash" in Flutterwave > Settings > Webhooks, with URL `https://YOUR-DOMAIN/api/flutterwave/webhook`. Optional locally.
 
 ## Test a payment
