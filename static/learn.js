@@ -186,7 +186,7 @@ function viewCourse(c) {
 /* ───────────── Full lesson reader + quiz ───────────── */
 async function openLesson(n) {
   $('#sheet').innerHTML = '<div class="sheet-in"><p class="meta" style="padding:40px 0;text-align:center">Opening lesson…</p></div>';
-  try { S.lesson = await api(`/api/courses/${encodeURIComponent(S.openId)}/lessons/${n}`); S.lesson.result = null; goView('lesson'); }
+  try { S.lesson = await api(`/api/courses/${encodeURIComponent(S.openId)}/lessons/${n}`); S.lesson.result = null; setImages(S.lesson, S.lesson.images); goView('lesson'); }
   catch (x) { toast(x.message, 'bad'); goView('course'); }
 }
 
@@ -217,37 +217,81 @@ function bindQuiz(c) {
   if (rt) rt.onclick = () => { l.result = null; q.innerHTML = quizHTML(l); bindQuiz(c); q.scrollIntoView({ behavior: 'smooth', block: 'start' }); };
 }
 
-/* ───────────── Fresh extras: a new example + task from the AI, a few times per lesson ───────────── */
-function freshHTML(l) {
-  const f = l.fresh;
-  if (!f || (!l.freshOn && !f.items.length)) return '';
-  const left = f.limit - f.items.length;
-  const card = (it, i) => `<article class="fx"><small>Fresh ${i + 1} of ${f.limit}</small><h4>${fmt(it.title)}</h4>${rich(it.example)}
-    <div class="fx-task"><b>Try it</b><p>${fmt(it.task)}</p></div>
-    <details><summary>${fmt(it.question)}</summary><p>${fmt(it.answer)}</p></details></article>`;
-  return `<section class="fresh" id="fresh"><h3>Want it a different way?</h3>
-    <p class="meta">Get a brand new example and a new practice task for this lesson. You can do this ${f.limit} times on each lesson, so pick your moments.</p>
-    ${f.items.map(card).join('')}
-    ${left > 0 ? `<p class="err" id="fx-e"></p><div class="pills"><button class="pill hot" id="fx-go">${f.items.length ? 'Another new example' : 'Show me a new example'} (${left} left)</button></div>`
-      : `<p class="meta fx-done">You have used all ${f.limit} for this lesson. The next lesson has its own ${f.limit}.</p>`}
-  </section>`;
+/* ───────────── Lesson pictures: describe a photo, the AI makes it (3 per lesson) ───────────── */
+let imgTimer = null;
+const fmtLeft = (ms) => { const t = Math.max(0, Math.ceil(ms / 1000)); return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`; };
+
+function setImages(l, st) {   // the server decides limits and blocks; the page only shows them
+  l.draft = l.draft || { prompt: '', size: 'landscape' };
+  l.images = st; st.until = st.blockedSeconds > 0 ? Date.now() + st.blockedSeconds * 1000 : 0;
+  if (st.errors && st.errors.length) l.imgNote = st.errors[st.errors.length - 1];
 }
 
-function bindFresh(c) {
-  const l = S.lesson, go = $('#fx-go');
-  if (!go) return;
-  go.onclick = async () => {
-    const label = go.textContent;
-    go.disabled = true; go.innerHTML = '<span class="spin"></span> Making a new one…'; $('#fx-e').textContent = '';
+function imagesHTML(l) {
+  const im = l.images;
+  if (!im || (!l.imagesOn && !im.items.length)) return '';
+  const left = im.limit - im.items.length, making = im.items.some((i) => i.status === 'making'), blocked = im.until > Date.now();
+  const figs = im.items.map((i) => i.status === 'ready'
+    ? `<figure class="im"><img src="${esc(i.url)}" alt="${esc(i.prompt)}" loading="lazy"><figcaption>${esc(i.prompt)}<a class="dl" href="${esc(i.url)}?dl=1" download>Download</a></figcaption></figure>`
+    : `<figure class="im making"><span class="spin"></span><p>Creating your picture. This can take up to a minute, and you can keep reading.</p></figure>`).join('');
+  let ui = '';
+  if (blocked) ui = `<div class="warn" role="alert"><b>Picture making is paused.</b>${l.imgNote ? `<p>${esc(l.imgNote)}</p>` : ''}
+    <p>Your prompt must be connected to the lesson. You can make pictures again in <b id="im-cd">${fmtLeft(im.until - Date.now())}</b>. Keep learning until then.</p></div>`;
+  else if (making) ui = '';
+  else if (left <= 0) ui = `<p class="meta">You have used all ${im.limit} pictures for this lesson. The next lesson has its own ${im.limit}.</p>`;
+  else ui = `${l.imgNote ? `<p class="err">${esc(l.imgNote)}</p>` : ''}
+    <label for="im-p">Describe the photo you want</label>
+    <textarea id="im-p" maxlength="400" placeholder="Example: a student in Lagos using a laptop to practise ${esc(l.title.toLowerCase())}">${esc(l.draft.prompt)}</textarea>
+    <div class="im-row"><select id="im-s" aria-label="Picture shape">${[['landscape', 'Landscape'], ['square', 'Square'], ['portrait', 'Portrait']].map(([v, t]) => `<option value="${v}" ${l.draft.size === v ? 'selected' : ''}>${t}</option>`).join('')}</select>
+      <button class="btn" id="im-go">GENERATE PICTURE (${left} left)</button></div>
+    <p class="err" id="im-e"></p>`;
+  return `<section class="imgs" id="imgs"><h3>Make a picture for this lesson</h3>
+    <p class="meta">Type what you want to see and the AI makes a realistic photo. You get ${im.limit} pictures on each lesson. Your prompt must be connected to this lesson: if it is not, you get a warning and picture making is blocked for ${im.blockMinutes} minutes.</p>
+    ${figs ? `<div class="im-grid">${figs}</div>` : ''}${ui}</section>`;
+}
+
+function paintImages(c) {
+  const el = $('#imgs'); if (!el) return;
+  el.outerHTML = imagesHTML(S.lesson); bindImages(c);
+}
+
+async function refreshImages(c) {
+  const l = S.lesson;
+  try { const r = await api(`/api/courses/${encodeURIComponent(c.id)}/lessons/${l.n}/images`); if (S.lesson !== l) return; setImages(l, r.images); paintImages(c); }
+  catch (_) {}
+}
+
+function startImgTimer(c) {   // one timer: counts down a block, and checks every 3 seconds on a picture being made
+  clearInterval(imgTimer);
+  const l = S.lesson; if (!l || !l.images) return;
+  const making = l.images.items.some((i) => i.status === 'making');
+  if (!making && l.images.until <= Date.now()) return;
+  let tick = 0;
+  imgTimer = setInterval(() => {
+    if (S.lesson !== l || !$('#imgs')) { clearInterval(imgTimer); return; }
+    if (l.images.until && l.images.until <= Date.now()) { l.images.until = 0; l.imgNote = ''; paintImages(c); return; }
+    const cd = $('#im-cd'); if (cd) cd.textContent = fmtLeft(l.images.until - Date.now());
+    if (making && ++tick % 3 === 0) refreshImages(c);
+  }, 1000);
+}
+
+function bindImages(c) {
+  const l = S.lesson, go = $('#im-go'), pr = $('#im-p'), sz = $('#im-s');
+  if (pr) { pr.oninput = () => { l.draft.prompt = pr.value; }; sz.onchange = () => { l.draft.size = sz.value; }; }
+  if (go) go.onclick = async () => {
+    const prompt = pr.value.trim();
+    if (prompt.length < 5) { $('#im-e').textContent = 'Describe the picture you want, at least 5 characters.'; return; }
+    go.disabled = true; go.innerHTML = '<span class="spin"></span> Checking your prompt…'; $('#im-e').textContent = ''; l.imgNote = '';
     try {
-      l.fresh = (await post(`/api/courses/${encodeURIComponent(c.id)}/lessons/${l.n}/fresh`, {})).fresh;
-      $('#fresh').outerHTML = freshHTML(l); bindFresh(c);
-      const cards = document.querySelectorAll('#fresh .fx'); if (cards.length) cards[cards.length - 1].scrollIntoView({ behavior: 'smooth', block: 'center' });
+      const r = await post(`/api/courses/${encodeURIComponent(c.id)}/lessons/${l.n}/images`, { prompt, size: sz.value });
+      l.draft.prompt = ''; setImages(l, r.images);
     } catch (x) {
-      if (x.status === 403) { await openLesson(l.n); return; }   // all used up elsewhere: refresh the page state
-      $('#fx-e').textContent = x.message; go.disabled = false; go.textContent = label;
+      if (x.status !== 429) l.imgNote = x.message;
+      if ([403, 409, 422, 429].includes(x.status)) { await refreshImages(c); paintImages(c); return; }   // the server is the source of truth for limits and blocks
     }
+    paintImages(c);
   };
+  startImgTimer(c);
 }
 
 function viewLesson(c) {
@@ -262,13 +306,13 @@ function viewLesson(c) {
     <section class="terms"><h3>Key terms</h3><dl>${l.terms.map(([t, d]) => `<dt>${esc(t)}</dt><dd>${esc(d)}</dd>`).join('')}</dl></section>
     <section class="oops"><h3>Common mistakes to avoid</h3><ul>${l.mistakes.map((m) => `<li>${esc(m)}</li>`).join('')}</ul></section>
     ${l.activity ? `<section><div class="act"><h4>Try it yourself</h4><p>${esc(l.activity)}</p></div></section>` : ''}
-    ${freshHTML(l)}
+    ${imagesHTML(l)}
     <section class="quiz" id="quiz">${quizHTML(l)}</section>
     <section><h3>Your notes</h3><textarea id="mynote" placeholder="What you learned, questions to ask, ideas for your project"></textarea><p class="meta">Saved on this device.</p></section>
     <div class="pills"><button class="pill markdone" id="md" aria-pressed="${done}">${done ? 'Marked as done' : 'Mark lesson as done'}</button>
       ${l.next ? '<button class="pill hot" id="nx">Next lesson</button>' : ''}<button class="pill" id="ca2">My CA and certificate</button></div>
   </article>`, () => goView('course'), '← Back to lessons');
-  bindQuiz(c); bindFresh(c);
+  bindQuiz(c); bindImages(c);
   const nk = `oats:note:${S.user.uid}:${c.id}:${l.n}`, nt = $('#mynote');
   try { nt.value = localStorage.getItem(nk) || ''; } catch (_) {}
   nt.oninput = () => { try { nt.value ? localStorage.setItem(nk, nt.value) : localStorage.removeItem(nk); } catch (_) {} };
