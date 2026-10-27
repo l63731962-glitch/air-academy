@@ -19,6 +19,8 @@ Open http://127.0.0.1:5000
 - `FLW_PUBLIC_KEY` / `FLW_SECRET_KEY`: Flutterwave dashboard > Settings > API keys. Use the TEST keys first.
 - `SMTP_*`: your email provider. Leave `SMTP_HOST` empty in development and the 6-digit code prints in the terminal instead.
 - `FREE_ACCESS_EMAILS`: optional, comma-separated full email addresses that get every course free (enrolled automatically at sign-in, including courses added later).
+- `OPENAI_API_KEY` (and optional `OPENAI_MODEL`, default `gpt-4o-mini`): powers the project generator and the "new example" button on lesson pages.
+- `LESSON_FRESH_LIMIT`: optional, how many AI-made examples each student can get per lesson page (default 3).
 - `FLW_WEBHOOK_HASH`: any random string; put the same value as "Secret hash" in Flutterwave > Settings > Webhooks, with URL `https://YOUR-DOMAIN/api/flutterwave/webhook`. Optional locally.
 
 ## Test a payment
