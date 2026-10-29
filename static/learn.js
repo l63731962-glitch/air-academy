@@ -117,10 +117,13 @@ const goView = (view) => { S.view = view; renderSheet(); $('#sheet').scrollTop =
 const cap = (s) => s[0].toUpperCase() + s.slice(1);
 
 function renderSheet() {
+  stopListening();
+  if (S.view === 'board') return viewBoard();
+  if (S.view === 'parents') return viewParents();
   if (S.view === 'projects') return viewStudio();
   if (S.view === 'groups') return viewGroups();
   const c = S.courses.find((x) => x.id === S.openId); if (!c) return;
-  ({ course: viewCourse, lesson: viewLesson, ca: viewCA, exam: viewExam, cert: viewCert }[S.view] || viewCourse)(c);
+  ({ course: viewCourse, lesson: viewLesson, practice: viewPractice, ca: viewCA, exam: viewExam, cert: viewCert }[S.view] || viewCourse)(c);
 }
 
 async function markDone(c, n) {
@@ -134,6 +137,7 @@ function viewCourse(c) {
   const L = open ? (S.detail && S.detail.lessons) || [] : Array.from({ length: c.lessonsCount }, (_, i) => ({ n: i + 1, title: 'Premium lesson content' }));
   const done = ready ? S.detail.done : [], total = L.length, dn = done.filter((n) => n <= total).length;
   const noteKey = (n) => `oats:note:${S.user.uid}:${c.id}:${n}`;
+  const wk = (S.detail && S.detail.weak) || { total: 0, lessons: [] };
   const rows = L.map((l, i) => open && l.deep ? `
     <button class="glass lesson deep ${done.includes(l.n) ? 'done' : ''}" style="--i:${i}" data-n="${l.n}">
       <span class="num">${l.n}</span><span class="t">${esc(l.title)}</span><span class="tag">Full lesson</span><span class="tick">${done.includes(l.n) ? '✓' : '○'}</span><span class="chev">▶</span>
@@ -153,8 +157,8 @@ function viewCourse(c) {
 
   sheet(`
     <div class="glass intro"><h2>${esc(c.title)}</h2><p>${esc(c.description)}</p>
-      ${ready && total ? `<div class="prog" id="prog"><i style="width:${(dn / total) * 100}%"></i></div><p class="meta" id="pt">${dn} of ${total} lessons done.</p>
-      <div class="pills"><button class="pill hot" id="ca">My CA and certificate</button><button class="pill" id="stu">Project Studio</button>${L.some((l) => !l.deep) ? '<button class="pill" id="ex">Expand all lessons</button>' : ''}<button class="pill" id="cp">Copy outline</button><button class="pill" id="pr">Print or save as PDF</button></div>` : ''}</div>
+      ${ready && total ? `<div class="prog" id="prog"><i style="width:${(dn / total) * 100}%"></i></div><p class="meta" id="pt">${dn} of ${total} lessons done.</p>${wk.total ? `<p class="meta weakline">Air Omega noticed questions to practise in: ${wk.lessons.map((x) => `Lesson ${x.n} (${x.count})`).join(', ')}.</p>` : ''}
+      <div class="pills"><button class="pill hot" id="ca">My CA and certificate</button><button class="pill" id="stu">Project Studio</button>${wk.total ? `<button class="pill hot" id="wk">Practice my weak spots (${wk.total})</button>` : ''}${L.some((l) => !l.deep) ? '<button class="pill" id="ex">Expand all lessons</button>' : ''}<button class="pill" id="cp">Copy outline</button><button class="pill" id="pr">Print or save as PDF</button></div>` : ''}</div>
     <div class="wrap${open ? '' : ' locked'}">
       <div class="lessons">${rows}</div>
       ${open ? '' : payCard(c)}
@@ -174,6 +178,7 @@ function viewCourse(c) {
   }));
   sh.querySelectorAll('.les textarea').forEach((t) => (t.oninput = () => { try { t.value ? localStorage.setItem(noteKey(t.dataset.n), t.value) : localStorage.removeItem(noteKey(t.dataset.n)); } catch (_) {} }));
   $('#ca').onclick = openCA; $('#stu').onclick = () => openStudio(c.id);
+  const wkb = $('#wk'); if (wkb) wkb.onclick = openPractice;
   const ex = $('#ex');
   if (ex) ex.onclick = () => { const ds = [...sh.querySelectorAll('.les')], o = ds.some((d) => !d.open); ds.forEach((d) => (d.open = o)); ex.textContent = o ? 'Collapse all lessons' : 'Expand all lessons'; };
   $('#cp').onclick = async () => {
@@ -199,18 +204,21 @@ function quizHTML(l) {
       ${q.o.map((o, j) => `<label class="opt ${r && j === r.results[i].answer ? 'right' : ''}"><input type="radio" name="q${i}" value="${j}" ${r ? 'disabled' : ''} ${r && l.picks[i] === j ? 'checked' : ''}><span>${esc(o)}</span></label>`).join('')}
       ${r ? `<p class="why"><b>${r.results[i].ok ? 'Correct.' : 'Not quite.'}</b> ${esc(r.results[i].why)}</p>` : ''}
     </fieldset>`).join('') +
-    (r ? `<p class="score">You scored ${r.score} of ${r.max}.</p><button class="pill" id="retake">Try the quiz again</button>`
+    (r ? `<p class="score">You scored ${r.score} of ${r.max}.</p><div class="pills"><button class="pill" id="retake">Try the quiz again</button>${r.score < r.max ? '<button class="pill hot" id="wk2">Practice my weak spots</button>' : ''}</div>`
        : '<p class="err" id="qe"></p><button class="btn" id="chk">CHECK MY ANSWERS</button>');
 }
 
 function bindQuiz(c) {
   const l = S.lesson, q = $('#quiz');
-  const chk = $('#chk'), rt = $('#retake');
+  const chk = $('#chk'), rt = $('#retake'), wk2 = $('#wk2');
+  if (wk2) wk2.onclick = openPractice;
   if (chk) chk.onclick = async () => {
     const picks = l.quiz.map((_, i) => { const x = q.querySelector(`input[name=q${i}]:checked`); return x ? +x.value : null; });
     if (picks.includes(null)) { $('#qe').textContent = 'Answer every question first.'; return; }
     chk.disabled = true;
-    try { l.result = await post(`/api/quiz/${encodeURIComponent(c.id)}/${l.n}`, { answers: picks }); l.picks = picks; l.best = Math.max(l.best ?? 0, l.result.score); }
+    try { l.result = await post(`/api/quiz/${encodeURIComponent(c.id)}/${l.n}`, { answers: picks }); l.picks = picks; l.best = Math.max(l.best ?? 0, l.result.score);
+      if (l.result.xp) toast(`+${l.result.xp} XP`);
+      api(`/api/courses/${encodeURIComponent(c.id)}/weak`).then((w) => { S.detail.weak = w.weak; }).catch(() => {}); }
     catch (x) { $('#qe').textContent = x.message; chk.disabled = false; return; }
     q.innerHTML = quizHTML(l); bindQuiz(c);
   };
@@ -294,25 +302,307 @@ function bindImages(c) {
   startImgTimer(c);
 }
 
+/* ───────────── Listen to this lesson (the browser's own English voice, free) ───────────── */
+const canSpeak = () => 'speechSynthesis' in window && typeof SpeechSynthesisUtterance !== 'undefined';
+let listening = null;   // null, or { paused }
+const speakPlain = (t) => String(t).replace(/\*\*(.+?)\*\*/g, '$1').replace(/`/g, '').replace(/\s+/g, ' ').trim();
+const CODE_LABEL = /^(code|html|css|js|javascript|python|sql|json|terminal|command|config|dart|gdscript|http|bash|yaml|folder)/i;
+
+function sayChunks(s, max = 180) {   // some browsers cut a long utterance off, so the lesson is spoken in short pieces
+  const out = [];
+  (String(s).match(/[^.!?]+[.!?]*\s*/g) || [String(s)]).forEach((sent) => {
+    sent = sent.trim();
+    while (sent.length > max) { let i = sent.lastIndexOf(' ', max); if (i < 40) i = max; out.push(sent.slice(0, i)); sent = sent.slice(i).trim(); }
+    if (sent) out.push(sent);
+  });
+  return out;
+}
+
+function speechParts(l) {
+  const t = [`${l.title}.`, speakPlain(l.hook)];
+  l.sections.forEach(([h, b]) => {
+    t.push(`${h}.`);
+    b.split(/\n{2,}/).forEach((blk) => {
+      const L = blk.split('\n');
+      if (L.every((x) => x === '>' || x.startsWith('> '))) {   // boxes: read example prompts aloud, skip code
+        const m = /^\[(.{1,28})\]$/.exec(L[0].slice(2).trim());
+        if (m && CODE_LABEL.test(m[1])) return;
+        t.push(speakPlain((m ? L.slice(1) : L).map((x) => x.slice(2)).join(' ')));
+      } else t.push(speakPlain(L.map((x) => x.replace(/^(- |\d+\. )/, '')).join('. ')));
+    });
+  });
+  t.push('Key terms.'); l.terms.forEach(([a, d]) => t.push(`${a}: ${d}`));
+  t.push('Common mistakes to avoid.'); l.mistakes.forEach((m) => t.push(m));
+  return t.filter(Boolean).flatMap((x) => sayChunks(x));
+}
+
+function pickVoice() {
+  const v = speechSynthesis.getVoices() || [];
+  return ['en-NG', 'en-GB', 'en-US'].map((c) => v.find((x) => String(x.lang).replace('_', '-') === c)).find(Boolean) || v.find((x) => /^en/i.test(x.lang));
+}
+
+function paintListen() {
+  const b = $('#ls'), x = $('#lsx'); if (!b) return;
+  b.textContent = !listening ? '🔊 Listen to this lesson' : listening.paused ? '▶ Resume listening' : '⏸ Pause';
+  x.hidden = !listening;
+}
+
+function stopListening() {
+  if (canSpeak()) { speechSynthesis.resume(); speechSynthesis.cancel(); }
+  listening = null; paintListen();
+}
+
+function startListening(l) {
+  speechSynthesis.resume(); speechSynthesis.cancel();
+  const voice = pickVoice(), parts = speechParts(l);
+  listening = { paused: false };
+  parts.forEach((txt, i) => {
+    const u = new SpeechSynthesisUtterance(txt); u.lang = voice ? voice.lang : 'en-GB'; u.rate = 0.95; if (voice) u.voice = voice;
+    if (i === parts.length - 1) u.onend = () => { listening = null; paintListen(); };
+    speechSynthesis.speak(u);
+  });
+  paintListen();
+}
+
+const listenHTML = () => canSpeak() ? '<div class="pills listen"><button class="pill" id="ls">🔊 Listen to this lesson</button><button class="pill" id="lsx" hidden>■ Stop</button></div>' : '';
+
+function bindListen(l) {
+  const b = $('#ls'); if (!b) return;
+  b.onclick = () => {
+    if (!listening) return startListening(l);
+    if (listening.paused) { speechSynthesis.resume(); listening.paused = false; } else { speechSynthesis.pause(); listening.paused = true; }
+    paintListen();
+  };
+  $('#lsx').onclick = stopListening;
+  paintListen();
+}
+
+/* ───────────── Ask Air Omega: a small chat on each lesson ───────────── */
+const bubble = (role, t) => `<div class="bub ${role === 'user' ? 'me' : 'bot'}">${role === 'user' ? '' : '<small>Air Omega</small>'}${fmt(t).replace(/\n/g, '<br>')}</div>`;
+
+function mentorHTML(l) {
+  const m = l.mentor; if (!m || (!l.aiOn && !m.messages.length)) return '';
+  const mode = l.mentorMode || 'normal', out = m.left <= 0;
+  return `<section class="mentor" id="mentor"><h3>Ask Air Omega</h3>
+    <p class="meta">Air Omega answers only from this lesson. <b id="m-left">${m.left}</b> of ${m.limit} questions left today.</p>
+    <div class="mchat" id="mchat" aria-live="polite">${bubble('assistant', m.intro + ' Ask me anything about this lesson.')}${m.messages.map((x) => bubble(x.role, x.content)).join('')}${l.mentorBusy ? '<div class="bub bot"><small>Air Omega</small><span class="dots"><i></i><i></i><i></i></span></div>' : ''}</div>
+    <div class="pills" id="mmodes">${[['normal', 'Normal'], ['like12', 'Like I\'m 12'], ['football', 'With football']].map(([v, t]) => `<button class="pill" data-mode="${v}" aria-pressed="${mode === v}">${t}</button>`).join('')}</div>
+    <div class="pills"><button class="pill hot" data-quick="like12" ${l.mentorBusy || out ? 'disabled' : ''}>Explain this lesson like I'm 12</button><button class="pill hot" data-quick="football" ${l.mentorBusy || out ? 'disabled' : ''}>Explain this lesson with football</button></div>
+    ${l.mentorErr ? `<p class="err">${esc(l.mentorErr)}</p>` : ''}
+    <div class="m-row"><textarea id="mq" rows="2" maxlength="500" aria-label="Your question" placeholder="${out ? 'You have used today\'s questions. Come back tomorrow.' : 'Ask a question about this lesson'}" ${out ? 'disabled' : ''}>${esc(l.mentorDraft || '')}</textarea>
+      <button class="btn" id="ms" ${l.mentorBusy || out ? 'disabled' : ''}>SEND</button></div></section>`;
+}
+
+function paintMentor(c) {
+  const el = $('#mentor'); if (!el) return;
+  el.outerHTML = mentorHTML(S.lesson); bindMentor(c);
+  const ch = $('#mchat'); if (ch) ch.scrollTop = ch.scrollHeight;
+}
+
+async function mentorSend(c, text, mode) {
+  const l = S.lesson, m = l.mentor; if (l.mentorBusy || text.trim().length < 2) return;
+  l.mentorMode = mode; l.mentorBusy = true; l.mentorErr = ''; l.mentorDraft = ''; m.messages.push({ role: 'user', content: text.trim() }); paintMentor(c);
+  try { const r = await post(`/api/courses/${encodeURIComponent(c.id)}/lessons/${l.n}/mentor`, { message: text.trim(), mode }); m.messages.push({ role: 'assistant', content: r.reply }); m.left = r.left; }
+  catch (x) { m.messages.pop(); l.mentorErr = x.message; l.mentorDraft = text.trim(); if (x.status === 429) m.left = 0; }
+  l.mentorBusy = false; if (S.lesson === l) paintMentor(c);
+}
+
+function bindMentor(c) {
+  const l = S.lesson, q = $('#mq'); if (!q) return;
+  const mode = () => l.mentorMode || 'normal';
+  $('#mmodes').querySelectorAll('[data-mode]').forEach((b) => (b.onclick = () => { l.mentorMode = b.dataset.mode; l.mentorDraft = q.value; paintMentor(c); }));
+  $('#mentor').querySelectorAll('[data-quick]').forEach((b) => (b.onclick = () => mentorSend(c, b.dataset.quick === 'like12' ? "Explain this lesson like I'm 12." : 'Explain this lesson with a football example.', b.dataset.quick)));
+  $('#ms').onclick = () => mentorSend(c, q.value, mode());
+  q.onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); mentorSend(c, q.value, mode()); } };
+  q.oninput = () => { l.mentorDraft = q.value; };
+}
+
+/* ───────────── Assignment: written by Air Omega, answered here, marked and scored by Air Omega ───────────── */
+function assignHTML(l) {
+  if (!l.aiOn && !l.assignment) return '';
+  const a = l.assignment, err = l.assignErr ? `<p class="err">${esc(l.assignErr)}</p>` : '';
+  let body;
+  if (!a) body = `<p class="meta">Air Omega writes an assignment for this lesson. You answer it here and Air Omega marks it and gives you a score. It counts towards your CA, and your best try is the one that counts.</p>${err}<button class="btn" id="ag" ${l.assignBusy ? 'disabled' : ''}>${l.assignBusy ? '<span class="spin"></span>' : 'GET MY ASSIGNMENT'}</button>`;
+  else {
+    const last = a.attempts[a.attempts.length - 1];
+    const result = last ? `<div class="result"><div class="scorebig"><b>${last.score}</b><span>/ ${a.max}</span></div><div>
+        <h4>Try ${last.n}: Air Omega's marking</h4>
+        <ul class="brk">${last.breakdown.map((r) => `<li><span>${esc(r.c)}</span><b>${r.got}/${r.pts}</b>${r.note ? `<small>${esc(r.note)}</small>` : ''}</li>`).join('')}</ul></div></div>
+      <div class="bub bot wide"><small>Air Omega says</small>${esc(last.feedback)}</div>
+      ${a.attempts.length > 1 ? `<p class="meta">All tries: ${a.attempts.map((t) => `try ${t.n}: ${t.score}/${a.max}`).join(', ')}. Your best is ${a.best}/${a.max}.</p>` : ''}` : '';
+    const form = a.marking || l.assignBusy ? '<div class="marking"><span class="spin"></span> Air Omega is marking your work. This takes up to a minute.</div>'
+      : a.left > 0 ? `${err}<label for="aa">Your answer</label><textarea id="aa" rows="7" maxlength="3000" placeholder="Write your answer here (20 to 3000 characters)">${esc(l.assignDraft || '')}</textarea>
+        <p class="meta"><span id="ac">${(l.assignDraft || '').length}</span> of 3000 characters. Tries left: ${a.left} of ${a.limit}.</p><button class="btn" id="as">SUBMIT FOR MARKING</button>`
+      : `<p class="meta">You have used all ${a.limit} tries. Your best score is ${a.best}/${a.max}.</p>`;
+    body = `<h4 class="at">${esc(a.title)}</h4><p>${esc(a.brief)}</p>
+      <p class="meta">How you will be marked (out of ${a.max}):</p><ul class="rub">${a.rubric.map((r) => `<li>${esc(r.c)} <b>${r.pts}</b></li>`).join('')}</ul>${result}${form}`;
+  }
+  return `<section class="assign" id="assign"><h3>Assignment, marked by Air Omega</h3>${body}</section>`;
+}
+
+let assignTimer = null;
+function paintAssign(c) { const el = $('#assign'); if (!el) return; el.outerHTML = assignHTML(S.lesson); bindAssign(c); }
+
+function bindAssign(c) {
+  clearInterval(assignTimer);
+  const l = S.lesson, base = `/api/courses/${encodeURIComponent(c.id)}/lessons/${l.n}/assignment`;
+  const ag = $('#ag'), as = $('#as'), aa = $('#aa');
+  if (ag) ag.onclick = async () => {
+    l.assignBusy = true; l.assignErr = ''; paintAssign(c);
+    try { l.assignment = (await post(base, {})).assignment; } catch (x) { l.assignErr = x.message; }
+    l.assignBusy = false; if (S.lesson === l) paintAssign(c);
+  };
+  if (aa) aa.oninput = () => { l.assignDraft = aa.value; $('#ac').textContent = aa.value.length; };
+  if (as) as.onclick = async () => {
+    const answer = aa.value.trim();
+    if (answer.length < 20) { l.assignErr = 'Write at least 20 characters.'; paintAssign(c); return; }
+    l.assignDraft = answer; l.assignBusy = true; l.assignErr = ''; paintAssign(c);
+    try {
+      const r = await post(base + '/submit', { answer }); l.assignment = r.assignment; l.assignDraft = '';
+      if (r.xp) toast(`+${r.xp} XP`);
+    } catch (x) { l.assignErr = x.message; }
+    l.assignBusy = false; if (S.lesson === l) paintAssign(c);
+  };
+  if (l.assignment && l.assignment.marking && !l.assignBusy) {   // came back while Air Omega was still marking: check until it is done
+    assignTimer = setInterval(async () => {
+      if (S.lesson !== l || !$('#assign')) { clearInterval(assignTimer); return; }
+      try { const r = await api(base); if (r.assignment && !r.assignment.marking) { l.assignment = r.assignment; clearInterval(assignTimer); paintAssign(c); } } catch (_) {}
+    }, 4000);
+  }
+}
+
+/* ───────────── Weak spots: practice exactly what was missed ───────────── */
+async function openPractice() {
+  try { const r = await post(`/api/courses/${encodeURIComponent(S.openId)}/practice`, {}); S.practice = { ...r.practice, result: null, busy: false }; goView('practice'); }
+  catch (x) { toast(x.message, 'bad'); }
+}
+
+function viewPractice(c) {
+  const p = S.practice, r = p.result;
+  sheet(`<div class="glass intro"><h2>Practice my weak spots</h2><p>Air Omega wrote these new questions from the ones you missed. They do not change your CA. Every right answer earns 2 XP.</p></div>
+  <article class="reader"><section class="quiz" id="pq">
+    ${p.questions.map((q, i) => `<fieldset class="q ${r ? (r.results[i].ok ? 'ok' : 'no') : ''}"><legend>${i + 1}. ${esc(q.q)}</legend><small class="meta">From: ${esc(q.lesson)}</small>
+      ${q.o.map((o, j) => `<label class="opt ${r && j === r.results[i].answer ? 'right' : ''}"><input type="radio" name="p${i}" value="${j}" ${r ? 'disabled' : ''} ${r && p.picks[i] === j ? 'checked' : ''}><span>${esc(o)}</span></label>`).join('')}
+      ${r ? `<p class="why"><b>${r.results[i].ok ? 'Correct.' : 'Not quite.'}</b> ${esc(r.results[i].why)}</p>` : ''}</fieldset>`).join('')}
+    ${r ? `<p class="score">You scored ${r.score} of ${r.max}${r.xp ? ` and earned ${r.xp} XP` : ''}.</p>
+        <p class="meta">${r.weak.total ? `Air Omega still sees ${r.weak.total} question${r.weak.total === 1 ? '' : 's'} to practise.` : 'No weak spots left. Great work.'}</p>
+        <div class="pills">${r.weak.total && r.weak.left > 0 ? '<button class="pill hot" id="pagain">Practice again</button>' : ''}<button class="pill" id="pback">Back to lessons</button></div>`
+      : '<p class="err" id="pe"></p><button class="btn" id="pchk">CHECK MY ANSWERS</button>'}
+  </section></article>`, () => goView('course'), '← Back to lessons');
+  const chk = $('#pchk'); if (chk) chk.onclick = async () => {
+    const picks = p.questions.map((_, i) => { const x = $('#pq').querySelector(`input[name=p${i}]:checked`); return x ? +x.value : null; });
+    if (picks.includes(null)) { $('#pe').textContent = 'Answer every question first.'; return; }
+    chk.disabled = true;
+    try { p.result = await post('/api/practice/' + p.id, { answers: picks }); p.picks = picks; S.detail.weak = p.result.weak; if (p.result.xp) toast(`+${p.result.xp} XP`); }
+    catch (x) { $('#pe').textContent = x.message; chk.disabled = false; return; }
+    viewPractice(c);
+  };
+  const pa = $('#pagain'); if (pa) pa.onclick = openPractice;
+  const pb = $('#pback'); if (pb) pb.onclick = () => goView('course');
+}
+
+/* ───────────── Weekly leaderboard (class groups, opt-in) ───────────── */
+const dur = (s) => { const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60); return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`; };
+S.board = { data: null, loaded: false };
+
+async function openBoard() {
+  S.openId = null; S.view = 'board'; S.board.loaded = false;
+  $('#sheet').hidden = false; document.body.classList.add('lock'); renderSheet();
+  try { S.board.data = (await api('/api/board')).board; } catch (x) { toast(x.message, 'bad'); }
+  S.board.loaded = true; if (S.view === 'board') renderSheet();
+}
+
+function viewBoard() {
+  const b = S.board.data, ld = S.board.loaded;
+  const body = !ld ? '<p class="meta" style="text-align:center;padding:30px 0">Loading…</p>'
+    : !b ? '<p class="empty">The leaderboard is for students in a class group. Open your teacher\'s invite link to join one.</p>'
+    : `<div class="glass intro"><h2>Weekly leaderboard</h2><p>${esc(b.group)}. The week ends in <b>${dur(b.endsIn)}</b>, then everyone starts again from zero.</p>
+        <p class="meta">Earn XP: finishing a lesson 10, a lesson quiz up to 20, an assignment up to 30, the final exam up to 50, and 2 for each right answer in weak-spot practice (up to 30 a day).</p></div>
+      ${b.optedIn ? '' : '<div class="glass panel"><h3>Join the leaderboard?</h3><p>Only students who join are shown. Your classmates will see your first name and the first letter of your last name, and your XP. You can leave any time.</p><button class="btn" id="bj">JOIN THE LEADERBOARD</button></div>'}
+      ${b.top.length ? `<div class="glass tablewrap"><table><thead><tr><th>#</th><th>Student</th><th>XP this week</th></tr></thead><tbody>
+        ${b.top.map((t) => `<tr class="${t.you ? 'me' : ''}"><td>${t.rank}</td><td>${esc(t.name)}${t.you ? ' (you)' : ''}</td><td><b>${t.xp}</b></td></tr>`).join('')}</tbody></table></div>`
+        : '<p class="empty">Nobody has joined this week\'s leaderboard yet.</p>'}
+      ${b.optedIn && b.you ? `<p class="meta">You are number ${b.you.rank} with ${b.you.xp} XP this week.</p><div class="pills"><button class="pill" id="bl">Leave the leaderboard</button></div>` : ''}`;
+  sheet(body, closeSheet, '← Back');
+  const flip = (on) => async () => { try { await post('/api/board/optin', { on }); await openBoard(); } catch (x) { toast(x.message, 'bad'); } };
+  const bj = $('#bj'); if (bj) bj.onclick = flip(true);
+  const bl = $('#bl'); if (bl) bl.onclick = flip(false);
+}
+
+/* ───────────── Parent updates (a weekly progress email, with the parent's consent) ───────────── */
+S.parents = { list: [], loaded: false };
+async function openParents() {
+  S.openId = null; S.view = 'parents'; S.parents.loaded = false;
+  $('#sheet').hidden = false; document.body.classList.add('lock'); renderSheet();
+  try { S.parents.list = (await api('/api/parents')).contacts; } catch (x) { toast(x.message, 'bad'); }
+  S.parents.loaded = true; if (S.view === 'parents') renderSheet();
+}
+
+function viewParents() {
+  const P = S.parents, tag = { waiting: 'Waiting for them to confirm', active: 'Getting weekly updates', stopped: 'Stopped' };
+  sheet(`<div class="glass intro"><h2>Parent updates</h2><p>Add a parent or guardian. We email them first, and nothing else is sent until they confirm. After that they get a short progress email every Monday: lessons finished, quiz and assignment scores, and XP. Every email has a link to stop.</p></div>
+    ${P.loaded ? '' : '<p class="meta" style="text-align:center;padding:20px 0">Loading…</p>'}
+    ${P.list.map((c) => `<div class="glass reqrow ${c.status}"><div><b>${esc(c.email)}</b><small>${tag[c.status]}</small></div><button class="pill" data-rmp="${c.id}">Remove</button></div>`).join('')}
+    <div class="glass panel studio"><label for="pe">Parent or guardian email</label><input id="pe" type="email" maxlength="120" placeholder="parent@example.com" autocomplete="off">
+      <p class="err" id="pee"></p><button class="btn" id="pa">SEND CONFIRMATION EMAIL</button></div>`, closeSheet, '← Back');
+  $('#pa').onclick = async () => {
+    const e = $('#pe').value.trim().toLowerCase(), b = $('#pa'); $('#pee').textContent = '';
+    if (!EMAIL_RX.test(e)) { $('#pee').textContent = 'Enter a valid email address.'; return; }
+    b.disabled = true; b.innerHTML = '<span class="spin"></span>';
+    try { await post('/api/parents', { email: e }); toast('Confirmation email sent. Ask them to check their inbox and spam folder.'); await openParents(); }
+    catch (x) { $('#pee').textContent = x.message; b.disabled = false; b.textContent = 'SEND CONFIRMATION EMAIL'; }
+  };
+  $('#sheet').querySelectorAll('[data-rmp]').forEach((b) => (b.onclick = async () => {
+    try { await post(`/api/parents/${b.dataset.rmp}/remove`, {}); await openParents(); } catch (x) { toast(x.message, 'bad'); }
+  }));
+}
+
+/* ───────────── Teacher page: weekly leaderboard and the prize ───────────── */
+function boardAdminHTML(d) {
+  const b = d.board; if (!b) return '';
+  const w = b.winner;
+  return `<section class="glass intro"><h3>Weekly leaderboard</h3>
+    <p class="meta">XP earned this week. Only students who joined the leaderboard are shown to the class, and only they can win.</p>
+    ${b.week.length ? `<div class="tablewrap"><table><thead><tr><th>Student</th><th>XP this week</th><th>On leaderboard</th></tr></thead><tbody>${b.week.map((s) => `<tr><td>${esc(s.name)}</td><td><b>${s.xp}</b></td><td>${s.opted ? 'Yes' : 'No'}</td></tr>`).join('')}</tbody></table></div>` : '<p class="meta">No students yet.</p>'}
+    <div class="prize"><h4>Last week (${esc(b.weekLabel)})</h4>
+    ${w ? (b.prize ? `<p>🏆 <b>${esc(w.name)}</b> won with ${w.xp} XP. You gave them <b>${esc(b.prize.course)}</b> free.</p>`
+      : `<p>🏆 <b>${esc(w.name)}</b> won with ${w.xp} XP. Give them a free track:</p><div class="m-row"><select id="pz" aria-label="Track to give">${d.courses.map((c) => `<option value="${esc(c.id)}">${esc(c.title)}</option>`).join('')}</select><button class="pill hot" id="pzb" data-winner="${esc(w.name)}">Give a free track</button></div>`)
+      : '<p class="meta">No winner yet. A student must join the leaderboard and earn XP.</p>'}</div></section>`;
+}
+
+function bindPrize(token) {
+  const b = $('#pzb'); if (!b) return;
+  b.onclick = async () => {
+    const sel = $('#pz'); if (!confirm(`Give ${b.dataset.winner} the track "${sel.options[sel.selectedIndex].text}" for free? You can give one prize each week.`)) return;
+    b.disabled = true;
+    try { await post(`/api/groups/admin/${encodeURIComponent(token)}/prize`, { courseId: sel.value }); toast('Done. The track is now unlocked for them.'); }
+    catch (x) { toast(x.message, 'bad'); }
+    paintAdmin(token, await api('/api/groups/admin/' + encodeURIComponent(token)));
+  };
+}
+
 function viewLesson(c) {
   const l = S.lesson, total = S.detail.lessons.length, done = S.detail.done.includes(l.n);
   sheet(`
   <article class="reader">
     <p class="crumb"><span>Lesson ${l.n} of ${total}</span><span>${l.minutes} minute read</span></p>
     <h2>${esc(l.title)}</h2>
+    ${listenHTML()}
     <p class="lead">${fmt(l.hook)}</p>
     <figure class="fig">${l.diagram}<figcaption>${esc(l.caption)}</figcaption></figure>
     ${l.sections.map(([h, b], i) => `<section><h3><span>${i + 1}</span>${esc(h)}</h3>${rich(b)}</section>`).join('')}
     <section class="terms"><h3>Key terms</h3><dl>${l.terms.map(([t, d]) => `<dt>${esc(t)}</dt><dd>${esc(d)}</dd>`).join('')}</dl></section>
     <section class="oops"><h3>Common mistakes to avoid</h3><ul>${l.mistakes.map((m) => `<li>${esc(m)}</li>`).join('')}</ul></section>
     ${l.activity ? `<section><div class="act"><h4>Try it yourself</h4><p>${esc(l.activity)}</p></div></section>` : ''}
+    ${mentorHTML(l)}
     ${imagesHTML(l)}
     <section class="quiz" id="quiz">${quizHTML(l)}</section>
+    ${assignHTML(l)}
     <section><h3>Your notes</h3><textarea id="mynote" placeholder="What you learned, questions to ask, ideas for your project"></textarea><p class="meta">Saved on this device.</p></section>
     <div class="pills"><button class="pill markdone" id="md" aria-pressed="${done}">${done ? 'Marked as done' : 'Mark lesson as done'}</button>
       ${l.next ? '<button class="pill hot" id="nx">Next lesson</button>' : ''}<button class="pill" id="ca2">My CA and certificate</button></div>
   </article>`, () => goView('course'), '← Back to lessons');
-  bindQuiz(c); bindImages(c);
+  bindQuiz(c); bindImages(c); bindMentor(c); bindAssign(c); bindListen(l);
   const nk = `oats:note:${S.user.uid}:${c.id}:${l.n}`, nt = $('#mynote');
   try { nt.value = localStorage.getItem(nk) || ''; } catch (_) {}
   nt.oninput = () => { try { nt.value ? localStorage.setItem(nk, nt.value) : localStorage.removeItem(nk); } catch (_) {} };
@@ -328,12 +618,12 @@ async function openCA() {
 
 function viewCA(c) {
   const r = S.ca, w = r.weights;
-  const intro = `<div class="glass intro"><h2>My CA and certificate</h2><p>${esc(c.title)}. Continuous assessment (CA) is the average of your best lesson quiz scores and counts for ${w.ca}%. The final exam counts for ${w.exam}%. Pass mark: ${w.pass}%.</p></div>`;
+  const intro = `<div class="glass intro"><h2>My CA and certificate</h2><p>${esc(c.title)}. ${w.assign ? `Continuous assessment (CA) counts for ${w.ca}%: your best lesson quiz scores make up ${w.quiz}% and your assignments, marked by Air Omega, make up ${w.assign}%.` : `Continuous assessment (CA) is the average of your best lesson quiz scores and counts for ${w.ca}%.`} The final exam counts for ${w.exam}%. Pass mark: ${w.pass}%.</p></div>`;
   if (!r.lessons.length) { sheet(`${intro}<p class="empty">Quizzes, the final exam and the certificate for this course are being prepared. Your lessons and projects are available now.</p>`, () => goView('course'), '← Back to lessons'); return; }
   sheet(`${intro}
     <div class="stats"><div><strong>${r.ca}%</strong><span>CA average</span></div><div><strong>${r.exam == null ? '–' : r.exam + '%'}</strong><span>Final exam</span></div><div class="${r.passed ? 'pass' : ''}"><strong>${r.total}%</strong><span>Overall</span></div></div>
-    <div class="glass tablewrap"><table><thead><tr><th>Lesson quiz</th><th>Best score</th><th>Tries</th></tr></thead><tbody>
-      ${r.lessons.map((l) => `<tr><td>${l.n}. ${esc(l.title)}</td><td>${l.pct == null ? 'Not taken' : l.pct + '%'}</td><td>${l.tries}</td></tr>`).join('')}
+    <div class="glass tablewrap"><table><thead><tr><th>Lesson quiz</th><th>Best score</th><th>Tries</th>${w.assign ? '<th>Assignment</th>' : ''}</tr></thead><tbody>
+      ${r.lessons.map((l) => `<tr><td>${l.n}. ${esc(l.title)}</td><td>${l.pct == null ? 'Not taken' : l.pct + '%'}</td><td>${l.tries}</td>${w.assign ? `<td>${l.assign == null ? 'Not done' : l.assign + '%'}</td>` : ''}</tr>`).join('')}
     </tbody></table></div>
     <div class="glass intro next"><h3>${r.cert ? 'You earned this certificate' : r.passed ? 'You passed. Your certificate is ready.' : r.exam != null ? 'Almost there' : 'Your next step'}</h3>
       <p>${r.cert || r.passed ? 'Download it, share it, and anyone can verify it online with its ID.' : !r.examReady ? 'Take every lesson quiz first. The final exam opens when your CA record is complete.' : r.exam != null ? `Your overall score is ${r.total}%. You need ${w.pass}% to earn the certificate. Retake the exam to improve.` : 'Your CA record is complete. Take the final exam to earn your certificate.'}</p>
@@ -582,10 +872,11 @@ function paintAdmin(token, d) {
     <section class="glass intro"><h3>Requests ${waiting.length ? `<b class="waiting">${waiting.length} waiting</b>` : ''}</h3>
       ${d.requests.length ? d.requests.map((r) => `<div class="reqrow ${r.status}"><div><b>${esc(r.student)}</b> wants to unlock <b>${esc(r.course)}</b><small>${esc(r.email)}, ${esc(r.at)}</small></div>
         ${r.status === 'pending' ? `<div class="pills"><button class="pill hot" data-rid="${r.id}" data-allow="1">Allow</button><button class="pill" data-rid="${r.id}" data-allow="0">Do not allow</button></div>` : `<span class="tag ${r.status}">${tag[r.status]}</span>`}</div>`).join('') : '<p class="meta">No requests yet. When a student asks to unlock the next class, it appears here and you get an email.</p>'}</section>
+    ${boardAdminHTML(d)}
     <section class="glass intro"><h3>Students (${d.students.length})</h3>${d.students.length ? `<div class="tablewrap"><table><thead><tr><th>Student</th>${g.steps.map((s, i) => `<th>Step ${i + 1}: ${esc(s.title)}</th>`).join('')}<th></th></tr></thead><tbody>
       ${d.students.map((s) => `<tr><td><b>${esc(s.name)}</b><br><small>${esc(s.email)}<br>Joined ${esc(s.joinedAt)}</small></td>${s.classes.map((c) => `<td>${c.owned ? `Unlocked<br><small>${c.done} of ${c.total} lessons${c.score ? `<br>CA ${c.score.ca}%, exam ${c.score.exam == null ? 'not taken' : c.score.exam + '%'}${c.score.passed ? ', passed' : ''}` : ''}</small>` : '<small>Not yet</small>'}</td>`).join('')}
         <td><button class="pill" data-rm="${esc(s.uid)}" data-name="${esc(s.name)}">Remove</button></td></tr>`).join('')}</tbody></table></div>` : '<p class="meta">No students yet. Send them the invite link.</p>'}</section></div>`;
-  bindCopy($('#app'));
+  bindCopy($('#app')); bindPrize(token);
   $('#app').querySelectorAll('[data-rid]').forEach((b) => (b.onclick = async () => {
     b.disabled = true;
     try { await post(`/api/groups/admin/${encodeURIComponent(token)}/requests/${b.dataset.rid}`, { allow: b.dataset.allow === '1' }); toast(b.dataset.allow === '1' ? 'Allowed. The student can now unlock it.' : 'Not allowed.'); }
