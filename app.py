@@ -6,7 +6,7 @@ from functools import wraps
 import psycopg
 import requests
 from dotenv import load_dotenv
-from flask import Flask, Response, g, jsonify, request, send_from_directory, session
+from flask import Flask, Response, g, has_request_context, jsonify, request, send_from_directory, session
 from markupsafe import escape
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -14,6 +14,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 from course_content import CONTENT, KINDS, RUBRIC, STEPS
 from courses_seed import COURSES, LESSONS, NOTES
+import omega
 
 load_dotenv()
 
@@ -88,6 +89,44 @@ CREATE INDEX IF NOT EXISTS lesson_images_uid ON lesson_images(uid, status);
 -- A student whose prompt had nothing to do with the lesson cannot make images until until_ts (unix seconds).
 CREATE TABLE IF NOT EXISTS image_blocks(
   uid TEXT PRIMARY KEY, until_ts BIGINT NOT NULL, reason TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
+
+-- Air Omega. The mentor chat on each lesson.
+CREATE TABLE IF NOT EXISTS mentor_messages(
+  id BIGSERIAL PRIMARY KEY, uid TEXT NOT NULL, course_id TEXT NOT NULL, lesson_n INTEGER NOT NULL,
+  role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS mentor_messages_lesson ON mentor_messages(uid, course_id, lesson_n, id);
+-- Which quiz and exam questions a student got right or wrong. A question is a weak spot while the latest answer to it was wrong.
+CREATE TABLE IF NOT EXISTS question_stats(
+  uid TEXT NOT NULL, course_id TEXT NOT NULL, lesson_n INTEGER NOT NULL, qi INTEGER NOT NULL,
+  n_right INTEGER NOT NULL DEFAULT 0, n_wrong INTEGER NOT NULL DEFAULT 0,
+  last_wrong_at TEXT NOT NULL DEFAULT '', last_right_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(uid, course_id, lesson_n, qi));
+-- AI practice sets built from the weak spots. items holds the answers, which only leave the server after grading.
+CREATE TABLE IF NOT EXISTS practice_sets(
+  id BIGSERIAL PRIMARY KEY, uid TEXT NOT NULL, course_id TEXT NOT NULL, items TEXT NOT NULL, created_at TEXT NOT NULL, submitted_at TEXT);
+CREATE INDEX IF NOT EXISTS practice_sets_uid ON practice_sets(uid, created_at);
+-- Points. Append-only; the weekly leaderboard adds up one week of them.
+CREATE TABLE IF NOT EXISTS xp_events(
+  id BIGSERIAL PRIMARY KEY, uid TEXT NOT NULL, kind TEXT NOT NULL, ref TEXT NOT NULL, points INTEGER NOT NULL, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS xp_events_uid ON xp_events(uid, created_at);
+-- A student appears on their class leaderboard only after opting in.
+CREATE TABLE IF NOT EXISTS board_optins(uid TEXT PRIMARY KEY, shown_name TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS prize_awards(
+  id BIGSERIAL PRIMARY KEY, group_id TEXT NOT NULL, uid TEXT NOT NULL, course_id TEXT NOT NULL, week_start TEXT NOT NULL,
+  created_at TEXT NOT NULL, UNIQUE(group_id, week_start));
+-- One AI-written assignment per student per lesson, marked by the AI. A marking attempt stays 'marking' until the AI answers.
+CREATE TABLE IF NOT EXISTS assignments(
+  id BIGSERIAL PRIMARY KEY, uid TEXT NOT NULL, course_id TEXT NOT NULL, lesson_n INTEGER NOT NULL, title TEXT NOT NULL, brief TEXT NOT NULL,
+  rubric TEXT NOT NULL, max_points INTEGER NOT NULL, created_at TEXT NOT NULL, UNIQUE(uid, course_id, lesson_n));
+CREATE TABLE IF NOT EXISTS assignment_attempts(
+  id BIGSERIAL PRIMARY KEY, assignment_id BIGINT NOT NULL, uid TEXT NOT NULL, attempt INTEGER NOT NULL, answer TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'marking', score INTEGER NOT NULL DEFAULT 0, breakdown TEXT NOT NULL DEFAULT '[]',
+  feedback TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, UNIQUE(assignment_id, attempt));
+-- Parents and guardians who get a weekly email. Nothing is sent until they confirm from their own inbox.
+CREATE TABLE IF NOT EXISTS parent_contacts(
+  id BIGSERIAL PRIMARY KEY, uid TEXT NOT NULL, email TEXT NOT NULL, token TEXT NOT NULL UNIQUE,
+  confirmed_at TEXT NOT NULL DEFAULT '', stopped_at TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, sent_at TEXT NOT NULL, UNIQUE(uid, email));
+-- Stops a weekly email going out twice for the same week.
+CREATE TABLE IF NOT EXISTS report_log(key TEXT NOT NULL, week_start TEXT NOT NULL, sent_at TEXT NOT NULL, PRIMARY KEY(key, week_start));
 """
 
 GROUP_SCHEMA = """
@@ -107,7 +146,9 @@ CREATE TABLE IF NOT EXISTS purchase_requests(
 # Supabase publishes every table in the public schema through its REST API, which the public "anon" key can reach.
 # Row Level Security with no policies shuts that door. This app talks to Postgres directly as the owner role, which is unaffected.
 TABLES = ("users", "courses", "enrollments", "otp_codes", "payments", "pending_signups", "progress", "scores", "certificates",
-          "class_groups", "class_group_courses", "class_group_members", "purchase_requests", "lesson_images", "image_blocks")
+          "class_groups", "class_group_courses", "class_group_members", "purchase_requests", "lesson_images", "image_blocks",
+          "mentor_messages", "question_stats", "practice_sets", "xp_events", "board_optins", "prize_awards", "assignments",
+          "assignment_attempts", "parent_contacts", "report_log")
 
 
 def now_iso():
@@ -276,7 +317,8 @@ def lesson_json(cid, i, title):
 @app.before_request
 def json_only_posts():
     # Cross-site forms can't send application/json without a CORS preflight, which blocks CSRF.
-    if request.method == "POST" and request.endpoint != "flutterwave_webhook" and not request.is_json:
+    # The webhook and the weekly-report trigger are called by other servers and are protected by their own secrets.
+    if request.method == "POST" and request.endpoint not in ("flutterwave_webhook", "weekly_reports_run") and not request.is_json:
         return err("Content-Type must be application/json.", 415)
 
 
@@ -537,6 +579,7 @@ def course_detail(cid):
     if unlocked:   # real content is never sent to locked users
         out["lessons"] = [lesson_json(cid, i, t) for i, t in enumerate(LESSONS.get(cid, []))]
         out["done"] = done_list(g.user["uid"], cid)
+        out["weak"] = weak_summary(g.user["uid"], cid)
     return jsonify(out)
 
 # ───────────────────────── Flutterwave payments ─────────────────────────
@@ -638,6 +681,10 @@ def flutterwave_webhook():
 
 # ───────────────────────── Progress, quizzes, CA record, exams, certificates ─────────────────────────
 W_CA, W_EXAM, PASS_MARK, EXAM_SIZE = 40, 60, 50, 10     # CA 40% + exam 60%, pass at 50%
+# Inside the CA share: AI-marked assignments count for ASSIGNMENT_WEIGHT points, lesson quizzes for the rest.
+# ASSIGNMENT_WEIGHT=0 gives the old rule (quizzes only).
+W_ASSIGN = max(0, min(W_CA, int(os.getenv("ASSIGNMENT_WEIGHT", "15"))))
+W_QUIZ = W_CA - W_ASSIGN
 
 
 def done_list(uid, cid):
@@ -664,6 +711,8 @@ def set_progress():
     else:
         db().execute("DELETE FROM progress WHERE uid=? AND course_id=? AND lesson_n=?", (g.user["uid"], cid, n))
     db().commit()
+    if b.get("done"):
+        award_up_to(g.user["uid"], "lesson", f"{cid}:{n}", 10)
     return jsonify(done=done_list(g.user["uid"], cid))
 
 
@@ -687,7 +736,9 @@ def lesson_page(cid, n):
     out = {k: c[k] for k in ("minutes", "hook", "sections", "diagram", "caption", "terms", "mistakes")}
     return jsonify(out | {"n": n, "title": LESSONS[cid][n - 1], "activity": lesson_json(cid, n - 1, "")["activity"], "quiz": [{"q": q["q"], "o": q["o"]} for q in c["quiz"]],
                           "best": best_quiz(g.user["uid"], cid, n), "next": (n + 1) in CONTENT[cid],
-                          "images": image_state(g.user["uid"], cid, n), "imagesOn": bool(os.getenv("OPENAI_API_KEY"))})
+                          "images": image_state(g.user["uid"], cid, n), "imagesOn": bool(os.getenv("OPENAI_API_KEY")),
+                          "mentor": mentor_state(g.user["uid"], cid, n), "assignment": assignment_state(g.user["uid"], cid, n),
+                          "aiOn": bool(os.getenv("OPENAI_API_KEY"))})
 
 
 def grade(qs, answers):
@@ -714,7 +765,10 @@ def submit_quiz(cid, n):
     res = grade(quiz_of(cid, n), (request.get_json(silent=True) or {}).get("answers"))
     if not res:
         return err("Answer every question first.")
-    return jsonify(score=record("quiz", cid, n, res), max=len(res), results=res)
+    score = record("quiz", cid, n, res)
+    note_answers(g.user["uid"], cid, [(n, i, r["ok"]) for i, r in enumerate(res)])
+    xp = award_up_to(g.user["uid"], "quiz", f"{cid}:{n}", round(20 * score / len(res)))
+    return jsonify(score=score, max=len(res), results=res, xp=xp)
 
 
 def exam_pool(cid):
@@ -751,24 +805,34 @@ def exam_submit(cid):
     if not res:
         return err("Answer every question first.")
     session.pop("exam")
-    return jsonify(score=record("exam", cid, 0, res), max=len(res), results=res, ca=ca_record(g.user["uid"], cid))
+    score = record("exam", cid, 0, res)
+    note_answers(g.user["uid"], cid, [(n, i, r["ok"]) for (n, i), r in zip(ex["refs"], res)])
+    xp = award_up_to(g.user["uid"], "exam", cid, round(50 * score / len(res)))
+    return jsonify(score=score, max=len(res), results=res, ca=ca_record(g.user["uid"], cid), xp=xp)
 
 
 def ca_record(uid, cid):
-    """Continuous assessment: best score per lesson quiz (40%) + best exam (60%). Pass mark 50%."""
+    """Continuous assessment: best lesson quiz and best assignment per lesson (W_CA% together) + best exam (W_EXAM%). Pass mark 50%."""
     rows = db().execute("""SELECT kind, ref, MAX(CAST(score AS DOUBLE PRECISION) / max_score) pct, COUNT(*) tries FROM scores
                            WHERE uid=? AND course_id=? GROUP BY kind, ref""", (uid, cid)).fetchall()
     quiz = {r["ref"]: r for r in rows if r["kind"] == "quiz"}
     exam = next((r for r in rows if r["kind"] == "exam"), None)
+    assign = {r["n"]: r for r in db().execute("""SELECT a.lesson_n n, MAX(CAST(t.score AS DOUBLE PRECISION) / a.max_points) pct, COUNT(*) tries
+                                                 FROM assignment_attempts t JOIN assignments a ON a.id=t.assignment_id
+                                                 WHERE t.uid=? AND a.course_id=? AND t.status='done' GROUP BY a.lesson_n""", (uid, cid)).fetchall()}
     lessons = [{"n": n, "title": LESSONS[cid][n - 1], "pct": round(quiz[n]["pct"] * 100) if n in quiz else None,
-                "tries": quiz[n]["tries"] if n in quiz else 0} for n in sorted(CONTENT.get(cid, {}))]
-    ca = round(sum(l["pct"] or 0 for l in lessons) / len(lessons)) if lessons else 0
+                "tries": quiz[n]["tries"] if n in quiz else 0,
+                "assign": round(assign[n]["pct"] * 100) if n in assign else None} for n in sorted(CONTENT.get(cid, {}))]
+    quiz_avg = round(sum(l["pct"] or 0 for l in lessons) / len(lessons)) if lessons else 0
+    assign_avg = round(sum(l["assign"] or 0 for l in lessons) / len(lessons)) if lessons else 0
+    ca = round((quiz_avg * W_QUIZ + assign_avg * W_ASSIGN) / W_CA)
     ex = round(exam["pct"] * 100) if exam else None
     total = round(ca * W_CA / 100 + (ex or 0) * W_EXAM / 100)
     cert = db().execute("SELECT cert_id FROM certificates WHERE uid=? AND course_id=?", (uid, cid)).fetchone()
     return {"lessons": lessons, "ca": ca, "exam": ex, "examTries": exam["tries"] if exam else 0, "total": total,
             "passed": ex is not None and total >= PASS_MARK, "cert": cert["cert_id"] if cert else None,
-            "weights": {"ca": W_CA, "exam": W_EXAM, "pass": PASS_MARK},
+            "weights": {"ca": W_CA, "exam": W_EXAM, "pass": PASS_MARK, "quiz": W_QUIZ, "assign": W_ASSIGN},
+            "quizAvg": quiz_avg, "assignAvg": assign_avg,
             "examReady": len(exam_pool(cid)) >= 4 and all(l["pct"] is not None for l in lessons)}
 
 
@@ -1024,6 +1088,595 @@ def lesson_image_file(iid):
     return resp
 
 
+# ───────────────────────── Air Omega: XP, mentor, weak-spot practice, assignments ─────────────────────────
+# Air Omega is the Open Air Tech Space AI assistant. Every AI feature below speaks as Air Omega (see omega.py).
+# All of them follow the same rules as the picture maker: the checks run on the server, a failure never uses up a turn,
+# and nothing waits on OpenAI while holding a database connection.
+MENTOR_DAILY = int(os.getenv("MENTOR_DAILY_LIMIT", "20"))        # questions per student per day, across all lessons
+PRACTICE_DAILY = int(os.getenv("PRACTICE_DAILY_LIMIT", "5"))     # weak-spot practice sets per student per day
+ASSIGN_ATTEMPTS = int(os.getenv("ASSIGNMENT_ATTEMPTS", "2"))     # tries per assignment. The best score counts.
+PRACTICE_XP_CAP = 30                                              # practice XP per day, so it cannot be farmed
+CRON_SECRET = os.getenv("CRON_SECRET", "")
+STALE_ATTEMPT_SECONDS = 300                                       # a marking that never finished is cancelled after this
+
+
+def ai_ready():
+    return bool(os.getenv("OPENAI_API_KEY"))
+
+
+def openai_chat(messages, *, json_mode=False, temperature=0.4, max_tokens=None, timeout=40):
+    body = {"model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"), "messages": messages, "temperature": temperature}
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
+    if max_tokens:
+        body["max_tokens"] = max_tokens
+    r = requests.post("https://api.openai.com/v1/chat/completions", headers={"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"},
+                      json=body, timeout=timeout)
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+
+def openai_json(messages, **kw):
+    return json.loads(openai_chat(messages, json_mode=True, **kw))
+
+
+def flagged(text):
+    """OpenAI's free safety check. If it cannot be reached the text is let through: the prompts also forbid unsafe content."""
+    try:
+        m = requests.post("https://api.openai.com/v1/moderations", headers={"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}, timeout=15,
+                          json={"model": os.getenv("OPENAI_MODERATION_MODEL", "omni-moderation-latest"), "input": text})
+        m.raise_for_status()
+        return bool(m.json()["results"][0]["flagged"])
+    except Exception:
+        log.exception("moderation check failed, continuing")
+        return False
+
+
+def lesson_ctx(cid, n):
+    page = CONTENT.get(cid, {}).get(n)
+    if not page:
+        return None
+    return db().execute("SELECT title FROM courses WHERE id=?", (cid,)).fetchone()["title"], LESSONS[cid][n - 1], page
+
+
+def base_url():
+    return (os.getenv("PUBLIC_URL") or (request.host_url if has_request_context() else "")).rstrip("/")
+
+
+# ---- XP ----
+def award_up_to(uid, kind, ref, target):
+    """Top (kind, ref) up to `target` XP in total and return what was newly added. Repeating work never earns twice, and a
+    better score only earns the difference."""
+    have = db().execute("SELECT COALESCE(SUM(points),0) s FROM xp_events WHERE uid=? AND kind=? AND ref=?", (uid, kind, ref)).fetchone()["s"]
+    add = int(target) - int(have)
+    if add <= 0:
+        return 0
+    db().execute("INSERT INTO xp_events(uid,kind,ref,points,created_at) VALUES(?,?,?,?,?)", (uid, kind, ref, add, now_iso()))
+    db().commit()
+    return add
+
+
+# ---- Mentor: a small chat on each lesson ----
+def mentor_state(uid, cid, n):
+    rows = db().execute("SELECT role, content FROM (SELECT id, role, content FROM mentor_messages WHERE uid=? AND course_id=? AND lesson_n=? "
+                        "ORDER BY id DESC LIMIT 30) t ORDER BY id", (uid, cid, n)).fetchall()
+    used = db().execute("SELECT COUNT(*) c FROM mentor_messages WHERE uid=? AND role='user' AND created_at>=?", (uid, omega.day_start())).fetchone()["c"]
+    return {"intro": omega.AIR_INTRO, "limit": MENTOR_DAILY, "left": max(0, MENTOR_DAILY - used), "messages": rows}
+
+
+@app.post("/api/courses/<cid>/lessons/<int:n>/mentor")
+@login_required
+def mentor_ask(cid, n):
+    bad = locked_error(cid)
+    if bad:
+        return bad
+    ctx = lesson_ctx(cid, n)
+    if not ctx:
+        return err("This lesson page is being prepared.", 404)
+    if not ai_ready():
+        return err("Air Omega is not switched on yet.", 503)
+    b = request.get_json(silent=True) or {}
+    msg = " ".join(str(b.get("message", "")).split())[:500]
+    if len(msg) < 2:
+        return err("Type your question first.")
+    mode = b.get("mode") if b.get("mode") in omega.MENTOR_MODES else "normal"
+    uid = g.user["uid"]
+    state = mentor_state(uid, cid, n)
+    if state["left"] <= 0:
+        return err(f"You have used your {MENTOR_DAILY} questions for today. Come back tomorrow, and use today to read the lesson again.", 429)
+    system = omega.mentor_system(*ctx, mode)
+    history = state["messages"][-8:]
+    release_db()   # the AI can take several seconds: do not hold a database connection while waiting
+    if flagged(msg):
+        return err("I can only help with questions about this lesson.", 422)
+    try:
+        reply = openai_chat([{"role": "system", "content": system}, *history, {"role": "user", "content": msg}],
+                            temperature=0.5, max_tokens=450, timeout=40).strip()[:1800]
+        if not reply:
+            raise ValueError("empty reply")
+    except Exception:
+        log.exception("mentor reply failed")
+        return err("Air Omega could not answer right now. That did not use up one of your questions. Please try again.", 502)
+    now = now_iso()
+    for role, text in (("user", msg), ("assistant", reply)):
+        db().execute("INSERT INTO mentor_messages(uid,course_id,lesson_n,role,content,created_at) VALUES(?,?,?,?,?,?)", (uid, cid, n, role, text, now))
+    db().commit()
+    return jsonify(reply=reply, left=state["left"] - 1, limit=MENTOR_DAILY)
+
+
+# ---- Weak spots: remember what was missed, then practise exactly that ----
+def note_answers(uid, cid, triples):
+    """Record right or wrong for (lesson, question index) pairs. Used by quizzes, exams and practice sets alike."""
+    now = now_iso()
+    for n, qi, ok in triples:
+        db().execute(
+            "INSERT INTO question_stats(uid,course_id,lesson_n,qi,n_right,n_wrong,last_wrong_at,last_right_at) VALUES(?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(uid,course_id,lesson_n,qi) DO UPDATE SET n_right=question_stats.n_right+excluded.n_right, "
+            "n_wrong=question_stats.n_wrong+excluded.n_wrong, "
+            "last_wrong_at=CASE WHEN excluded.n_wrong>0 THEN excluded.last_wrong_at ELSE question_stats.last_wrong_at END, "
+            "last_right_at=CASE WHEN excluded.n_right>0 THEN excluded.last_right_at ELSE question_stats.last_right_at END",
+            (uid, cid, n, qi, int(ok), int(not ok), "" if ok else now, now if ok else ""))
+    db().commit()
+
+
+def weak_rows(uid, cid):
+    return db().execute("SELECT lesson_n, qi, n_wrong, n_right, last_wrong_at FROM question_stats WHERE uid=? AND course_id=? "
+                        "AND n_wrong>0 AND last_wrong_at>last_right_at", (uid, cid)).fetchall()
+
+
+def weak_summary(uid, cid):
+    rows, per = weak_rows(uid, cid), {}
+    for r in rows:
+        per[r["lesson_n"]] = per.get(r["lesson_n"], 0) + 1
+    used = db().execute("SELECT COUNT(*) c FROM practice_sets WHERE uid=? AND created_at>=?", (uid, omega.day_start())).fetchone()["c"]
+    return {"total": len(rows), "limit": PRACTICE_DAILY, "left": max(0, PRACTICE_DAILY - used),
+            "lessons": [{"n": n, "title": LESSONS[cid][n - 1], "count": c} for n, c in sorted(per.items(), key=lambda kv: (-kv[1], kv[0]))]}
+
+
+@app.get("/api/courses/<cid>/weak")
+@login_required
+def weak_get(cid):
+    return locked_error(cid) or jsonify(weak=weak_summary(g.user["uid"], cid))
+
+
+def practice_view(sid, items):
+    return {"id": sid, "questions": [{"q": x["q"], "o": x["o"], "lesson": LESSONS[x["cid"]][x["n"] - 1]} for x in items]}
+
+
+@app.post("/api/courses/<cid>/practice")
+@login_required
+def practice_make(cid):
+    bad = locked_error(cid)
+    if bad:
+        return bad
+    if not ai_ready():
+        return err("Air Omega is not switched on yet.", 503)
+    uid = g.user["uid"]
+    rows = weak_rows(uid, cid)
+    if not rows:
+        return err("You have no weak spots right now. Take a lesson quiz, and Air Omega will notice anything you miss.", 409)
+    fresh = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
+    open_set = db().execute("SELECT id, items FROM practice_sets WHERE uid=? AND course_id=? AND submitted_at IS NULL AND created_at>=? "
+                            "ORDER BY id DESC LIMIT 1", (uid, cid, fresh)).fetchone()
+    if open_set:   # an unfinished set is handed back, which costs nothing
+        return jsonify(practice=practice_view(open_set["id"], json.loads(open_set["items"])))
+    used = db().execute("SELECT COUNT(*) c FROM practice_sets WHERE uid=? AND created_at>=?", (uid, omega.day_start())).fetchone()["c"]
+    if used >= PRACTICE_DAILY:
+        return err(f"You have done {PRACTICE_DAILY} practice sets today. Great work. Come back tomorrow.", 429)
+    targets = []
+    for r in sorted(rows, key=lambda r: (-(r["n_wrong"] - r["n_right"]), r["last_wrong_at"]), reverse=False)[:5]:
+        qs = quiz_of(cid, r["lesson_n"])
+        if r["qi"] < len(qs):
+            q = qs[r["qi"]]
+            targets.append({"lesson": LESSONS[cid][r["lesson_n"] - 1], "q": q["q"], "a": q["o"][q["a"]], "why": q["why"], "n": r["lesson_n"], "qi": r["qi"]})
+    if not targets:
+        return err("You have no weak spots right now.", 409)
+    course = db().execute("SELECT title FROM courses WHERE id=?", (cid,)).fetchone()["title"]
+    release_db()
+    try:
+        made = omega.clean_practice(openai_json(omega.practice_messages(course, targets), temperature=0.7, timeout=45), len(targets))
+        if len(made) < min(3, len(targets)):
+            raise ValueError("too few usable questions")
+    except Exception:
+        log.exception("practice set failed")
+        return err("Air Omega could not make your practice set right now. It did not use up one of today's sets. Please try again.", 502)
+    items = [{"q": m["q"], "o": m["o"], "a": m["a"], "why": m["why"], "cid": cid, "n": targets[m["for"]]["n"], "qi": targets[m["for"]]["qi"]} for m in made]
+    sid = db().execute("INSERT INTO practice_sets(uid,course_id,items,created_at) VALUES(?,?,?,?) RETURNING id", (uid, cid, json.dumps(items), now_iso())).fetchone()["id"]
+    db().commit()
+    return jsonify(practice=practice_view(sid, items)), 201
+
+
+@app.post("/api/practice/<int:sid>")
+@login_required
+def practice_submit(sid):
+    uid = g.user["uid"]
+    answers = (request.get_json(silent=True) or {}).get("answers")
+    row = db().execute("SELECT items, course_id FROM practice_sets WHERE id=? AND uid=?", (sid, uid)).fetchone()
+    if row is None:
+        return err("Practice set not found.", 404)
+    items = json.loads(row["items"])
+    if not isinstance(answers, list) or len(answers) != len(items) or not all(isinstance(a, int) for a in answers):
+        return err("Answer every question first.")
+    claimed = db().execute("UPDATE practice_sets SET submitted_at=? WHERE id=? AND uid=? AND submitted_at IS NULL", (now_iso(), sid, uid)).rowcount
+    db().commit()
+    if not claimed:
+        return err("You already handed in this practice set.", 409)
+    res = [{"ok": a == x["a"], "answer": x["a"], "why": x["why"]} for x, a in zip(items, answers)]
+    note_answers(uid, row["course_id"], [(x["n"], x["qi"], r["ok"]) for x, r in zip(items, res)])
+    good = sum(r["ok"] for r in res)
+    have = db().execute("SELECT COALESCE(SUM(points),0) s FROM xp_events WHERE uid=? AND kind='practice' AND ref=?", (uid, omega.lagos_date())).fetchone()["s"]
+    xp = award_up_to(uid, "practice", omega.lagos_date(), min(PRACTICE_XP_CAP, have + 2 * good))
+    return jsonify(score=good, max=len(res), results=res, xp=xp, weak=weak_summary(uid, row["course_id"]))
+
+
+# ---- Assignments: Air Omega writes them, the student answers in the app, Air Omega marks and scores ----
+def assignment_state(uid, cid, n):
+    con = db()
+    stale = (datetime.now(timezone.utc) - timedelta(seconds=STALE_ATTEMPT_SECONDS)).isoformat(timespec="seconds")
+    if con.execute("DELETE FROM assignment_attempts WHERE uid=? AND status='marking' AND created_at<?", (uid, stale)).rowcount:
+        con.commit()   # a marking that never finished hands its attempt back
+    a = con.execute("SELECT * FROM assignments WHERE uid=? AND course_id=? AND lesson_n=?", (uid, cid, n)).fetchone()
+    if a is None:
+        return None
+    rows = con.execute("SELECT attempt, status, score, breakdown, feedback, created_at FROM assignment_attempts WHERE assignment_id=? ORDER BY attempt", (a["id"],)).fetchall()
+    done = [r for r in rows if r["status"] == "done"]
+    return {"title": a["title"], "brief": a["brief"], "rubric": json.loads(a["rubric"]), "max": a["max_points"], "limit": ASSIGN_ATTEMPTS,
+            "left": max(0, ASSIGN_ATTEMPTS - len(rows)), "marking": any(r["status"] == "marking" for r in rows),
+            "best": max((r["score"] for r in done), default=None),
+            "attempts": [{"n": r["attempt"], "score": r["score"], "feedback": r["feedback"], "breakdown": json.loads(r["breakdown"]),
+                          "at": r["created_at"][:16].replace("T", " ")} for r in done]}
+
+
+def assignment_gate(cid, n):
+    bad = locked_error(cid)
+    if bad:
+        return bad, None
+    ctx = lesson_ctx(cid, n)
+    if not ctx:
+        return err("This lesson page is being prepared.", 404), None
+    return (err("Air Omega is not switched on yet.", 503), None) if not ai_ready() else (None, ctx)
+
+
+@app.get("/api/courses/<cid>/lessons/<int:n>/assignment")
+@login_required
+def assignment_get(cid, n):
+    return locked_error(cid) or jsonify(assignment=assignment_state(g.user["uid"], cid, n))
+
+
+@app.post("/api/courses/<cid>/lessons/<int:n>/assignment")
+@login_required
+def assignment_create(cid, n):
+    """Get this lesson's assignment. Written once per student per lesson, then the same one is shown every time."""
+    bad, ctx = assignment_gate(cid, n)
+    if bad:
+        return bad
+    uid = g.user["uid"]
+    have = assignment_state(uid, cid, n)
+    if have:
+        return jsonify(assignment=have)
+    release_db()
+    try:
+        made = omega.clean_assignment(openai_json(omega.assignment_messages(*ctx), temperature=0.7, timeout=45))
+        if made is None:
+            raise ValueError("unusable assignment")
+    except Exception:
+        log.exception("assignment generation failed")
+        return err("Air Omega could not write your assignment right now. Please try again in a moment.", 502)
+    db().execute("INSERT INTO assignments(uid,course_id,lesson_n,title,brief,rubric,max_points,created_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",
+                 (uid, cid, n, made["title"], made["brief"], json.dumps(made["rubric"]), omega.ASSIGNMENT_TOTAL, now_iso()))
+    db().commit()
+    return jsonify(assignment=assignment_state(uid, cid, n)), 201
+
+
+@app.post("/api/courses/<cid>/lessons/<int:n>/assignment/submit")
+@login_required
+def assignment_submit(cid, n):
+    bad, ctx = assignment_gate(cid, n)
+    if bad:
+        return bad
+    uid, con = g.user["uid"], db()
+    st = assignment_state(uid, cid, n)
+    if st is None:
+        return err("Get your assignment first.", 404)
+    answer = omega.clean_answer((request.get_json(silent=True) or {}).get("answer"))
+    if answer is None:
+        return err("Write your answer first, between 20 and 3000 characters.")
+    if st["marking"]:
+        return err("Air Omega is still marking your last answer. Give it a moment.", 409)
+    if st["left"] <= 0:
+        return err(f"You have used all {st['limit']} tries for this assignment.", 403)
+    a = con.execute("SELECT id FROM assignments WHERE uid=? AND course_id=? AND lesson_n=?", (uid, cid, n)).fetchone()
+    try:   # reserve the try first, so two quick taps cannot mark twice
+        row = con.execute("INSERT INTO assignment_attempts(assignment_id,uid,attempt,answer,created_at) VALUES(?,?,?,?,?) RETURNING id",
+                          (a["id"], uid, len(st["attempts"]) + 1, answer, now_iso())).fetchone()["id"]
+        con.commit()
+    except psycopg.errors.IntegrityError:
+        con.rollback()
+        return err("Air Omega is still marking your last answer. Give it a moment.", 409)
+    release_db()
+    try:
+        marks = omega.clean_marks(openai_json(omega.marking_messages(*ctx[:2], st, answer), temperature=0, timeout=60), st["rubric"])
+        if marks is None:
+            raise ValueError("unusable marking")
+    except Exception:
+        log.exception("marking failed")
+        db().execute("DELETE FROM assignment_attempts WHERE id=?", (row,))
+        db().commit()
+        return err("Air Omega could not mark your work right now. That did not use up a try. Please try again.", 502)
+    breakdown = [{"c": r["c"], "pts": r["pts"], "got": got, "note": note} for r, got, note in zip(st["rubric"], marks["got"], marks["notes"])]
+    db().execute("UPDATE assignment_attempts SET status='done', score=?, breakdown=?, feedback=? WHERE id=?", (marks["score"], json.dumps(breakdown), marks["feedback"], row))
+    db().commit()
+    xp = award_up_to(uid, "assignment", f"{cid}:{n}", round(30 * marks["score"] / st["max"]))
+    return jsonify(assignment=assignment_state(uid, cid, n), xp=xp)
+
+
+# ───────────────────────── Weekly leaderboard (inside a class group, opt-in) ─────────────────────────
+def shown_name(u):
+    parts = (u["full_name"] or u["email"].split("@")[0]).split()
+    return f"{parts[0].title()} {parts[-1][0].upper()}." if len(parts) > 1 else parts[0].title()
+
+
+def board_rows(gid, start, end):
+    """Every member of the group with the XP earned between start and end, best first. `opted` says whether they chose to be shown."""
+    return db().execute("""SELECT m.uid, u.full_name, u.email, o.shown_name, (o.uid IS NOT NULL) AS opted, COALESCE(SUM(x.points),0) AS xp
+                           FROM class_group_members m JOIN users u ON u.uid=m.uid LEFT JOIN board_optins o ON o.uid=m.uid
+                           LEFT JOIN xp_events x ON x.uid=m.uid AND x.created_at>=? AND x.created_at<?
+                           WHERE m.group_id=? GROUP BY m.uid, u.full_name, u.email, o.uid, o.shown_name
+                           ORDER BY xp DESC, u.full_name, m.uid""", (start, end, gid)).fetchall()
+
+
+@app.get("/api/board")
+@login_required
+def board_get():
+    uid, grp = g.user["uid"], group_of(g.user["uid"])
+    if grp is None:
+        return jsonify(board=None)
+    rows = [r for r in board_rows(grp["id"], *omega.week_bounds()) if r["opted"]]
+    rank = lambda xp: 1 + sum(1 for r in rows if r["xp"] > xp)   # equal XP shares a rank
+    me = next((r for r in rows if r["uid"] == uid), None)
+    return jsonify(board={"group": grp["name"], "optedIn": me is not None, "members": len(rows), "endsIn": omega.seconds_to_week_end(),
+                          "top": [{"rank": rank(r["xp"]), "name": r["shown_name"], "xp": r["xp"], "you": r["uid"] == uid} for r in rows[:10]],
+                          "you": {"rank": rank(me["xp"]), "xp": me["xp"]} if me else None})
+
+
+@app.post("/api/board/optin")
+@login_required
+def board_optin():
+    uid, on = g.user["uid"], (request.get_json(silent=True) or {}).get("on")
+    if not isinstance(on, bool):
+        return err("Choose join or leave.")
+    if on and group_of(uid) is None:
+        return err("The leaderboard is for students in a class group.", 403)
+    if on:
+        db().execute("INSERT INTO board_optins(uid,shown_name,created_at) VALUES(?,?,?) ON CONFLICT(uid) DO UPDATE SET shown_name=excluded.shown_name",
+                     (uid, shown_name(g.user), now_iso()))
+    else:
+        db().execute("DELETE FROM board_optins WHERE uid=?", (uid,))
+    db().commit()
+    return jsonify(ok=True)
+
+
+def admin_board(grp):
+    """The teacher's view: this week for everyone, and last week's winner (opted-in students only) who can be given a free track."""
+    pack = lambda rows: [{"uid": r["uid"], "name": r["full_name"] or r["email"], "xp": r["xp"], "opted": r["opted"]} for r in rows]
+    this, last = board_rows(grp["id"], *omega.week_bounds()), board_rows(grp["id"], *omega.week_bounds(None, 1))
+    win = next((r for r in last if r["opted"] and r["xp"] > 0), None)
+    start = omega.week_bounds(None, 1)[0]
+    given = db().execute("SELECT p.course_id, c.title FROM prize_awards p JOIN courses c ON c.id=p.course_id WHERE p.group_id=? AND p.week_start=?", (grp["id"], start)).fetchone()
+    return {"week": pack(this), "lastWeek": pack(last), "weekLabel": omega.week_label(start),
+            "winner": {"uid": win["uid"], "name": win["full_name"] or win["email"], "xp": win["xp"]} if win else None,
+            "prize": {"course": given["title"]} if given else None}
+
+
+@app.post("/api/groups/admin/<token>/prize")
+def admin_prize(token):
+    """Give last week's winner one free track. One prize per group per week, and only to the winner the leaderboard names."""
+    grp = admin_group(token)
+    if not grp:
+        return err("This admin link is not valid.", 404)
+    cid = (request.get_json(silent=True) or {}).get("courseId")
+    start, end = omega.week_bounds(None, 1)
+    win = next((r for r in board_rows(grp["id"], start, end) if r["opted"] and r["xp"] > 0), None)
+    if win is None:
+        return err("There is no winner for last week yet. A student must be on the leaderboard and have earned XP.", 409)
+    if db().execute("SELECT 1 FROM courses WHERE id=?", (cid,)).fetchone() is None:
+        return err("Choose a track to give.")
+    who = win["full_name"] or win["email"]
+    if cid in enrolled_ids(win["uid"]):
+        return err(f"{who} already has that track. Choose another one.", 409)
+    try:
+        db().execute("INSERT INTO prize_awards(group_id,uid,course_id,week_start,created_at) VALUES(?,?,?,?,?)", (grp["id"], win["uid"], cid, start, now_iso()))
+    except psycopg.errors.IntegrityError:
+        db().rollback()
+        return err("You already gave this week's prize.", 409)
+    db().execute("INSERT INTO enrollments(uid,course_id,created_at) VALUES(?,?,?) ON CONFLICT DO NOTHING", (win["uid"], cid, now_iso()))
+    db().commit()
+    return jsonify(ok=True, winner=who)
+
+
+# ───────────────────────── Weekly progress emails (parents and teachers) ─────────────────────────
+@app.get("/api/parents")
+@login_required
+def parents_list():
+    rows = db().execute("SELECT id, email, confirmed_at, stopped_at FROM parent_contacts WHERE uid=? ORDER BY id", (g.user["uid"],)).fetchall()
+    return jsonify(contacts=[{"id": r["id"], "email": r["email"], "status": "stopped" if r["stopped_at"] else "active" if r["confirmed_at"] else "waiting"} for r in rows])
+
+
+def student_name(u):
+    return u["full_name"] or u["email"].split("@")[0]
+
+
+@app.post("/api/parents")
+@login_required
+def parents_add():
+    email = str((request.get_json(silent=True) or {}).get("email", "")).strip().lower()
+    if not EMAIL_RX.match(email) or len(email) > 120:
+        return err("Enter a valid email address.")
+    if ENV == "production" and not resend_ready():
+        return err("Email is not set up on this site yet, so parent updates are not available.", 503)
+    uid, con, now = g.user["uid"], db(), now_iso()
+    if con.execute("SELECT COUNT(*) c FROM parent_contacts WHERE uid=? AND sent_at>=?", (uid, omega.day_start())).fetchone()["c"] >= 5:
+        return err("Too many confirmation emails today. Please try again tomorrow.", 429)
+    ex = con.execute("SELECT * FROM parent_contacts WHERE uid=? AND email=?", (uid, email)).fetchone()
+    token, new_id = secrets.token_urlsafe(24), None
+    if ex:
+        if ex["confirmed_at"] and not ex["stopped_at"]:
+            return err("That email is already getting the weekly updates.")
+        if ex["sent_at"] > (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds"):
+            return err("A confirmation email was just sent. Check the inbox and the spam folder, or try again in an hour.", 429)
+        con.execute("UPDATE parent_contacts SET token=?, confirmed_at='', stopped_at='', sent_at=? WHERE id=?", (token, now, ex["id"]))
+    else:
+        if con.execute("SELECT COUNT(*) c FROM parent_contacts WHERE uid=? AND stopped_at=''", (uid,)).fetchone()["c"] >= 2:
+            return err("You can add up to 2 parent or guardian emails.")
+        new_id = con.execute("INSERT INTO parent_contacts(uid,email,token,created_at,sent_at) VALUES(?,?,?,?,?) RETURNING id", (uid, email, token, now, now)).fetchone()["id"]
+    con.commit()
+    try:
+        send_plain_email(email, *omega.parent_confirm_email(APP_NAME, student_name(g.user), f"{base_url()}/parents/confirm/{token}"))
+    except Exception:
+        log.exception("could not send the parent confirmation email")
+        if new_id:
+            db().execute("DELETE FROM parent_contacts WHERE id=?", (new_id,))
+            db().commit()
+        return err("Could not send the email. Check the address and try again.", 502)
+    return jsonify(ok=True)
+
+
+@app.post("/api/parents/<int:pid>/remove")
+@login_required
+def parents_remove(pid):
+    db().execute("DELETE FROM parent_contacts WHERE id=? AND uid=?", (pid, g.user["uid"]))
+    db().commit()
+    return jsonify(ok=True)
+
+
+def contact_by_token(token):
+    return db().execute("SELECT p.*, u.full_name, u.email AS student_email FROM parent_contacts p JOIN users u ON u.uid=p.uid WHERE p.token=?", (token,)).fetchone()
+
+
+def parent_html(heading, body, button=None, status=200):
+    return Response(omega.parent_page(APP_NAME, heading, body, button), status=status, mimetype="text/html")
+
+
+@app.get("/parents/confirm/<token>")
+def parents_confirm_page(token):
+    c = contact_by_token(token)
+    if c is None or c["stopped_at"]:
+        return parent_html("Link not valid", "This link is no longer valid. If you still want the updates, ask the student to send a new confirmation.", status=404)
+    if c["confirmed_at"]:
+        return parent_html("Already confirmed", f"You already get the weekly updates for {student_name(c)}. Each email has a link to stop them.")
+    return parent_html("Weekly progress updates", f"Do you want a short weekly progress update about {student_name(c)} from {APP_NAME}?", "Yes, send me the updates")
+
+
+@app.get("/parents/stop/<token>")
+def parents_stop_page(token):
+    c = contact_by_token(token)
+    if c is None:
+        return parent_html("Link not valid", "This link is no longer valid.", status=404)
+    if c["stopped_at"]:
+        return parent_html("Updates stopped", "You will not get any more weekly updates.")
+    return parent_html("Stop weekly updates?", f"You will stop getting weekly progress emails about {student_name(c)}.", "Stop the updates")
+
+
+@app.post("/api/parents/public/<action>/<token>")
+def parents_public(action, token):
+    c = contact_by_token(token)
+    if c is None or action not in ("confirm", "stop") or (action == "confirm" and c["stopped_at"]):
+        return err("This link is no longer valid.", 404)
+    if action == "confirm":
+        db().execute("UPDATE parent_contacts SET confirmed_at=? WHERE id=? AND confirmed_at=''", (now_iso(), c["id"]))
+        msg = f"Thank you. You will get a short weekly update about {student_name(c)}. Every email has a link to stop them."
+    else:
+        db().execute("UPDATE parent_contacts SET stopped_at=? WHERE id=? AND stopped_at=''", (now_iso(), c["id"]))
+        msg = "Done. You will not get any more weekly updates."
+    db().commit()
+    return jsonify(message=msg)
+
+
+def week_summary(uid, start, end):
+    one = lambda sql: db().execute(sql, (uid, start, end)).fetchone()
+    qz = one("SELECT COUNT(*) c, AVG(100.0 * score / max_score) a FROM scores WHERE uid=? AND kind='quiz' AND taken_at>=? AND taken_at<?")
+    asg = one("SELECT COUNT(*) c, AVG(100.0 * t.score / a.max_points) a FROM assignment_attempts t JOIN assignments a ON a.id=t.assignment_id "
+              "WHERE t.uid=? AND t.status='done' AND t.created_at>=? AND t.created_at<?")
+    avg = lambda r: None if r["a"] is None else round(float(r["a"]))
+    courses = [{"title": db().execute("SELECT title FROM courses WHERE id=?", (cid,)).fetchone()["title"], "done": len(done_list(uid, cid)), "total": len(LESSONS.get(cid, []))}
+               for cid in sorted(enrolled_ids(uid))]
+    return {"lessons": one("SELECT COUNT(*) c FROM progress WHERE uid=? AND done_at>=? AND done_at<?")["c"],
+            "quizzes": qz["c"], "quiz_avg": avg(qz), "assignments": asg["c"], "assign_avg": avg(asg),
+            "exam": one("SELECT COUNT(*) c FROM scores WHERE uid=? AND kind='exam' AND taken_at>=? AND taken_at<?")["c"],
+            "practice": one("SELECT COUNT(*) c FROM practice_sets WHERE uid=? AND submitted_at>=? AND submitted_at<?")["c"],
+            "xp": one("SELECT COALESCE(SUM(points),0) c FROM xp_events WHERE uid=? AND created_at>=? AND created_at<?")["c"],
+            "courses": courses, "weak": sum(len(weak_rows(uid, c)) for c in enrolled_ids(uid))}
+
+
+def _claim(key, start):
+    """Reserve one email. False means it was already sent for that week, so running the job twice never doubles up."""
+    ok = db().execute("INSERT INTO report_log(key,week_start,sent_at) VALUES(?,?,?) ON CONFLICT DO NOTHING", (key, start, now_iso())).rowcount == 1
+    db().commit()
+    return ok
+
+
+def _unclaim(key, start):
+    db().execute("DELETE FROM report_log WHERE key=? AND week_start=?", (key, start))
+    db().commit()
+
+
+def send_weekly_reports(base=None, now=None):
+    """Email last week's progress to every confirmed parent, and a class summary to every group owner. Safe to run more than once."""
+    if ENV == "production" and not resend_ready():   # otherwise the emails would only be printed in the log, and counted as sent
+        raise RuntimeError("RESEND_API_KEY and RESEND_FROM must be set to send the weekly emails")
+    start, end = omega.week_bounds(now, 1)
+    label, base, out = omega.week_label(start), (base if base is not None else base_url()), {"parents": 0, "teachers": 0, "failed": 0}
+    for c in db().execute("SELECT p.id, p.uid, p.email, p.token, u.full_name, u.email AS student_email FROM parent_contacts p JOIN users u ON u.uid=p.uid "
+                          "WHERE p.confirmed_at<>'' AND p.stopped_at=''").fetchall():
+        key = f"parent:{c['id']}"
+        if not _claim(key, start):
+            continue
+        try:
+            send_plain_email(c["email"], *omega.parent_report_email(APP_NAME, student_name({"full_name": c["full_name"], "email": c["student_email"]}), label,
+                                                                    week_summary(c["uid"], start, end), f"{base}/parents/stop/{c['token']}"))
+            out["parents"] += 1
+        except Exception:
+            log.exception("weekly parent email failed")
+            _unclaim(key, start)
+            out["failed"] += 1
+    for grp in db().execute("SELECT g.*, u.email AS owner_email FROM class_groups g JOIN users u ON u.uid=g.owner_uid").fetchall():
+        key = f"teacher:{grp['id']}"
+        rows = board_rows(grp["id"], start, end)
+        if not rows or not _claim(key, start):
+            continue
+        try:
+            people = []
+            for r in rows:
+                ws = week_summary(r["uid"], start, end)
+                people.append({"name": r["full_name"] or r["email"], "xp": r["xp"], "lessons": ws["lessons"], "assignments": ws["assignments"]})
+            win = next((r for r in rows if r["opted"] and r["xp"] > 0), None)
+            send_plain_email(grp["owner_email"], *omega.teacher_report_email(APP_NAME, grp["name"], label, people,
+                                                                            {"name": win["shown_name"], "xp": win["xp"]} if win else None, f"{base}/admin/{grp['admin_token']}"))
+            out["teachers"] += 1
+        except Exception:
+            log.exception("weekly teacher email failed")
+            _unclaim(key, start)
+            out["failed"] += 1
+    return out
+
+
+@app.post("/api/internal/weekly-reports")
+def weekly_reports_run():
+    """Called once a week by a scheduler (see README). It answers at once and sends the emails in the background."""
+    if not CRON_SECRET or not hmac.compare_digest(request.headers.get("X-Cron-Secret", "").encode(), CRON_SECRET.encode()):
+        return err("Not found.", 404)
+    base = base_url()
+
+    def job():
+        with app.app_context():
+            try:
+                log.info("weekly reports sent: %s", send_weekly_reports(base))
+            except Exception:
+                log.exception("weekly reports failed")
+    threading.Thread(target=job, daemon=True).start()
+    return jsonify(started=True), 202
+
+
 # ───────────────────────── Project studio ─────────────────────────
 
 
@@ -1261,7 +1914,8 @@ def admin_view(token):
             classes.append({"id": cid, "owned": True, "done": len(done_list(m["uid"], cid)), "total": len(LESSONS.get(cid, [])),
                             "score": {k: rec[k] for k in ("ca", "exam", "total", "passed")} if rec else None})
         students.append({"uid": m["uid"], "name": m["full_name"] or m["email"], "email": m["email"], "joinedAt": m["joined_at"][:10], "classes": classes})
-    return jsonify(group=group_summary(grp) | group_links(grp), students=students,
+    return jsonify(group=group_summary(grp) | group_links(grp), students=students, board=admin_board(grp),
+                   courses=[{"id": c, "title": t} for c, t in ((r["id"], r["title"]) for r in db().execute("SELECT id, title FROM courses ORDER BY id"))],
                    requests=[{"id": r["id"], "status": r["status"], "student": r["full_name"] or r["email"], "email": r["email"],
                               "course": titles.get(r["course_id"], r["course_id"]), "at": r["created_at"][:16].replace("T", " ")} for r in reqs])
 
