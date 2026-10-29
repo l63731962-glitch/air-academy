@@ -86,7 +86,7 @@ function renderDashboard(animate = true) {
   $('#app').innerHTML = `
   <header class="hero">
     <div class="hero-top"><span class="brandmark">${MARK}<b>${APP}</b></span><span class="spacer"></span>
-      <span class="badge"><i></i>Secure session</span>${S.canCreate ? `<button class="ghost" id="cg">Class groups${S.pending ? ` <b class="dot">${S.pending}</b>` : ''}</button>` : ''}<button class="ghost" id="ps">Project Studio</button><button class="ghost" id="out">Sign out</button></div>
+      <span class="badge"><i></i>Secure session</span>${S.canCreate ? `<button class="ghost" id="cg">Class groups${S.pending ? ` <b class="dot">${S.pending}</b>` : ''}</button>` : ''}<button class="ghost" id="ps">Project Studio</button><button class="ghost" id="pu">Parent updates</button><button class="ghost" id="out">Sign out</button></div>
     <div class="hero-body">
       <div>
         <p class="welcome">Welcome back, ${esc((S.user.fullName || S.user.email).split(' ')[0])}</p>
@@ -98,7 +98,7 @@ function renderDashboard(animate = true) {
       </div>
     </div>
   </header>
-  ${S.group ? `<div class="classbar"><b>${esc(S.group.name)}</b><span>${classbarText()}</span></div>` : ''}
+  ${S.group ? `<div class="classbar"><b>${esc(S.group.name)}</b><span>${classbarText()}</span><button class="pill hot" id="lb">Weekly leaderboard</button></div>` : ''}
   <div class="toolbar">
     <input id="q" type="search" placeholder="Search tracks" aria-label="Search tracks" value="${esc(S.q)}">
     <div class="seg">${tabs.map(([f, l]) => `<button data-f="${f}" aria-pressed="${S.filter === f}">${l}</button>`).join('')}</div>
@@ -112,12 +112,14 @@ function renderDashboard(animate = true) {
     renderGrid();
   }));
   $('#ps').onclick = () => openStudio();
+  $('#pu').onclick = () => openParents();
+  const lb = $('#lb'); if (lb) lb.onclick = () => openBoard();
   const cg = $('#cg'); if (cg) cg.onclick = () => openGroups();
   $('#out').onclick = async () => { try { await api('/api/auth/logout', { method: 'POST' }); } catch (_) {} S.user = null; S.courses = []; S.q = ''; S.filter = 'all'; S.group = null; S.pending = 0; renderLogin(); };
 }
 
 /* ───────────── Course sheet + paywall ───────────── */
-function closeSheet() { const s = $('#sheet'); s.hidden = true; s.innerHTML = ''; document.body.classList.remove('lock'); S.openId = null; S.detail = null; S.view = 'course'; S.lesson = null;
+function closeSheet() { if (window.speechSynthesis) speechSynthesis.cancel(); const s = $('#sheet'); s.hidden = true; s.innerHTML = ''; document.body.classList.remove('lock'); S.openId = null; S.detail = null; S.view = 'course'; S.lesson = null;
   if (S.user && $('#grid')) renderGrid();
 }
 
