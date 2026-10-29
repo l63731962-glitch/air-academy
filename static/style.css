@@ -420,3 +420,44 @@ a.pill{display:inline-block;text-decoration:none;color:inherit}
 @media (prefers-reduced-motion:reduce){.im{animation:none}}
 @media (max-width:480px){.im-row{flex-direction:column}.im-row select{flex:none;width:100%}}
 @media print{.imgs{display:none!important}}
+
+/* Air Omega: listen, mentor chat, assignment, practice, leaderboard, parents */
+.listen{margin:4px 0 14px}
+.classbar .pill{margin-left:auto}
+.weakline{color:#ffd37a}
+.reader .mentor,.reader .assign{padding:20px;border-radius:22px;border:1px solid rgba(138,43,226,.55);background:rgba(138,43,226,.07)}
+.reader .assign{border-color:rgba(255,180,60,.55);background:rgba(255,180,60,.06)}
+.reader .mentor h3,.reader .assign h3{margin-bottom:6px}
+.mchat{display:flex;flex-direction:column;gap:10px;max-height:380px;overflow:auto;padding:12px;margin:12px 0;border-radius:16px;background:rgba(0,0,0,.28);border:1px solid var(--line)}
+.bub{max-width:88%;padding:10px 14px;border-radius:16px;font-size:15px;line-height:1.6;overflow-wrap:anywhere}
+.bub small{display:block;margin-bottom:2px;font:700 11.5px 'Chakra Petch',sans-serif;letter-spacing:.8px;color:var(--cyan)}
+.bub.bot{align-self:flex-start;background:rgba(255,255,255,.08);border:1px solid var(--line)}
+.bub.me{align-self:flex-end;background:rgba(0,240,255,.14);border:1px solid rgba(0,240,255,.4)}
+.bub.wide{max-width:100%;margin:12px 0}
+.dots{display:inline-flex;gap:5px;padding:4px 0}
+.dots i{width:7px;height:7px;border-radius:50%;background:var(--cyan);animation:dot 1s infinite ease-in-out}
+.dots i:nth-child(2){animation-delay:.15s}.dots i:nth-child(3){animation-delay:.3s}
+@keyframes dot{0%,80%,100%{opacity:.25;transform:translateY(0)}40%{opacity:1;transform:translateY(-4px)}}
+.m-row{display:flex;gap:10px;align-items:stretch;margin-top:10px}
+.m-row textarea,.m-row select{flex:1;min-height:0}
+.m-row .btn{flex:0 0 auto;padding-left:22px;padding-right:22px}
+.reader .assign .at{margin:10px 0 6px;font-size:18px;color:#fff}
+.rub{margin:6px 0 14px;padding-left:20px}
+.rub li{margin:4px 0}.rub b{color:var(--cyan);margin-left:6px}
+.result{display:flex;gap:16px;align-items:flex-start;margin:14px 0 4px}
+.scorebig{flex:0 0 auto;min-width:96px;padding:12px 10px;border-radius:16px;text-align:center;border:1px solid var(--cyan);box-shadow:0 0 24px rgba(0,240,255,.2)}
+.scorebig b{display:block;font:700 38px/1 'Chakra Petch',sans-serif}.scorebig span{font-size:13px;color:var(--mut)}
+.result h4{margin:0 0 6px}
+.brk{margin:0;padding:0;list-style:none}
+.brk li{display:grid;grid-template-columns:1fr auto;gap:2px 10px;padding:7px 0;border-bottom:1px dashed var(--line)}
+.brk li:last-child{border-bottom:0}.brk small{grid-column:1/-1;color:var(--mut);font-size:13px;line-height:1.5}
+.marking{display:flex;gap:10px;align-items:center;margin:14px 0;padding:14px;border-radius:14px;border:1px dashed var(--line);color:var(--mut)}
+.reader .assign label{display:block;margin:14px 0 8px;font-weight:600;color:#fff}
+.reader .assign textarea{width:100%}
+tr.me td{background:rgba(0,240,255,.1)}
+.prize{margin-top:14px;padding-top:12px;border-top:1px dashed var(--line)}
+.prize h4{margin:0 0 6px}
+.reqrow.waiting small{color:#ffd37a}.reqrow.active small{color:#6af0a8}.reqrow.stopped small{color:var(--mut)}
+@media (max-width:480px){.result{flex-direction:column}.m-row{flex-direction:column}.m-row .btn{width:100%}.bub{max-width:96%}}
+@media (prefers-reduced-motion:reduce){.dots i{animation:none;opacity:.7}}
+@media print{.mentor,.assign,.listen{display:none!important}}
