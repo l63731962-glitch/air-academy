@@ -86,7 +86,7 @@ function renderDashboard(animate = true) {
   $('#app').innerHTML = `
   <header class="hero">
     <div class="hero-top"><span class="brandmark">${MARK}<b>${APP}</b></span><span class="spacer"></span>
-      <span class="badge"><i></i>Secure session</span>${S.canCreate ? `<button class="ghost" id="cg">Class groups${S.pending ? ` <b class="dot">${S.pending}</b>` : ''}</button>` : ''}<button class="ghost" id="ps">Project Studio</button><button class="ghost" id="pu">Parent updates</button><button class="ghost" id="out">Sign out</button></div>
+      <span class="badge"><i></i>Secure session</span>${S.canCreate ? `<button class="ghost" id="cg">Class groups${S.pending ? ` <b class="dot">${S.pending}</b>` : ''}</button>` : ''}<button class="ghost talk" id="tk">🎙 Talk to Air Omega</button><button class="ghost" id="ps">Project Studio</button><button class="ghost" id="pu">Parent updates</button><button class="ghost" id="out">Sign out</button></div>
     <div class="hero-body">
       <div>
         <p class="welcome">Welcome back, ${esc((S.user.fullName || S.user.email).split(' ')[0])}</p>
@@ -113,6 +113,7 @@ function renderDashboard(animate = true) {
   }));
   $('#ps').onclick = () => openStudio();
   $('#pu').onclick = () => openParents();
+  $('#tk').onclick = () => openTalk();
   const lb = $('#lb'); if (lb) lb.onclick = () => openBoard();
   const cg = $('#cg'); if (cg) cg.onclick = () => openGroups();
   $('#out').onclick = async () => { try { await api('/api/auth/logout', { method: 'POST' }); } catch (_) {} S.user = null; S.courses = []; S.q = ''; S.filter = 'all'; S.group = null; S.pending = 0; renderLogin(); };
