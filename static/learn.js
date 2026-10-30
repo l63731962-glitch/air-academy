@@ -118,12 +118,14 @@ const cap = (s) => s[0].toUpperCase() + s.slice(1);
 
 function renderSheet() {
   stopListening();
+  if (typeof pgCleanup === 'function') pgCleanup();
+  if (S.view === 'talk') return viewTalk();
   if (S.view === 'board') return viewBoard();
   if (S.view === 'parents') return viewParents();
   if (S.view === 'projects') return viewStudio();
   if (S.view === 'groups') return viewGroups();
   const c = S.courses.find((x) => x.id === S.openId); if (!c) return;
-  ({ course: viewCourse, lesson: viewLesson, practice: viewPractice, ca: viewCA, exam: viewExam, cert: viewCert }[S.view] || viewCourse)(c);
+  ({ course: viewCourse, lesson: viewLesson, play: viewPlay, practice: viewPractice, ca: viewCA, exam: viewExam, cert: viewCert }[S.view] || viewCourse)(c);
 }
 
 async function markDone(c, n) {
@@ -158,7 +160,7 @@ function viewCourse(c) {
   sheet(`
     <div class="glass intro"><h2>${esc(c.title)}</h2><p>${esc(c.description)}</p>
       ${ready && total ? `<div class="prog" id="prog"><i style="width:${(dn / total) * 100}%"></i></div><p class="meta" id="pt">${dn} of ${total} lessons done.</p>${wk.total ? `<p class="meta weakline">Air Omega noticed questions to practise in: ${wk.lessons.map((x) => `Lesson ${x.n} (${x.count})`).join(', ')}.</p>` : ''}
-      <div class="pills"><button class="pill hot" id="ca">My CA and certificate</button><button class="pill" id="stu">Project Studio</button>${wk.total ? `<button class="pill hot" id="wk">Practice my weak spots (${wk.total})</button>` : ''}${L.some((l) => !l.deep) ? '<button class="pill" id="ex">Expand all lessons</button>' : ''}<button class="pill" id="cp">Copy outline</button><button class="pill" id="pr">Print or save as PDF</button></div>` : ''}</div>
+      <div class="pills"><button class="pill hot" id="ca">My CA and certificate</button><button class="pill" id="stu">Project Studio</button><button class="pill hot" id="pgb">🧪 Playground</button>${wk.total ? `<button class="pill hot" id="wk">Practice my weak spots (${wk.total})</button>` : ''}${L.some((l) => !l.deep) ? '<button class="pill" id="ex">Expand all lessons</button>' : ''}<button class="pill" id="cp">Copy outline</button><button class="pill" id="pr">Print or save as PDF</button></div>` : ''}</div>
     <div class="wrap${open ? '' : ' locked'}">
       <div class="lessons">${rows}</div>
       ${open ? '' : payCard(c)}
@@ -179,6 +181,7 @@ function viewCourse(c) {
   sh.querySelectorAll('.les textarea').forEach((t) => (t.oninput = () => { try { t.value ? localStorage.setItem(noteKey(t.dataset.n), t.value) : localStorage.removeItem(noteKey(t.dataset.n)); } catch (_) {} }));
   $('#ca').onclick = openCA; $('#stu').onclick = () => openStudio(c.id);
   const wkb = $('#wk'); if (wkb) wkb.onclick = openPractice;
+  const pgb = $('#pgb'); if (pgb) pgb.onclick = openPlayground;
   const ex = $('#ex');
   if (ex) ex.onclick = () => { const ds = [...sh.querySelectorAll('.les')], o = ds.some((d) => !d.open); ds.forEach((d) => (d.open = o)); ex.textContent = o ? 'Collapse all lessons' : 'Expand all lessons'; };
   $('#cp').onclick = async () => {
@@ -387,9 +390,9 @@ function mentorHTML(l) {
     <p class="meta">Air Omega answers only from this lesson. <b id="m-left">${m.left}</b> of ${m.limit} questions left today.</p>
     <div class="mchat" id="mchat" aria-live="polite">${bubble('assistant', m.intro + ' Ask me anything about this lesson.')}${m.messages.map((x) => bubble(x.role, x.content)).join('')}${l.mentorBusy ? '<div class="bub bot"><small>Air Omega</small><span class="dots"><i></i><i></i><i></i></span></div>' : ''}</div>
     <div class="pills" id="mmodes">${[['normal', 'Normal'], ['like12', 'Like I\'m 12'], ['football', 'With football']].map(([v, t]) => `<button class="pill" data-mode="${v}" aria-pressed="${mode === v}">${t}</button>`).join('')}</div>
-    <div class="pills"><button class="pill hot" data-quick="like12" ${l.mentorBusy || out ? 'disabled' : ''}>Explain this lesson like I'm 12</button><button class="pill hot" data-quick="football" ${l.mentorBusy || out ? 'disabled' : ''}>Explain this lesson with football</button></div>
+    <div class="pills"><button class="pill hot" data-quick="like12" ${l.mentorBusy || out ? 'disabled' : ''}>Explain this lesson like I'm 12</button><button class="pill hot" data-quick="football" ${l.mentorBusy || out ? 'disabled' : ''}>Explain this lesson with football</button><label class="vchk"><input type="checkbox" id="mspk" ${typeof voPrefs === 'function' && voPrefs().speak ? 'checked' : ''}> 🔊 Speak replies</label></div>
     ${l.mentorErr ? `<p class="err">${esc(l.mentorErr)}</p>` : ''}
-    <div class="m-row"><textarea id="mq" rows="2" maxlength="500" aria-label="Your question" placeholder="${out ? 'You have used today\'s questions. Come back tomorrow.' : 'Ask a question about this lesson'}" ${out ? 'disabled' : ''}>${esc(l.mentorDraft || '')}</textarea>
+    <div class="m-row"><button class="mic" id="mmic" aria-label="Talk to Air Omega" ${l.mentorBusy || out ? 'disabled' : ''}>🎤</button><textarea id="mq" rows="2" maxlength="500" aria-label="Your question" placeholder="${out ? 'You have used today\'s questions. Come back tomorrow.' : 'Ask a question about this lesson'}" ${out ? 'disabled' : ''}>${esc(l.mentorDraft || '')}</textarea>
       <button class="btn" id="ms" ${l.mentorBusy || out ? 'disabled' : ''}>SEND</button></div></section>`;
 }
 
@@ -399,10 +402,10 @@ function paintMentor(c) {
   const ch = $('#mchat'); if (ch) ch.scrollTop = ch.scrollHeight;
 }
 
-async function mentorSend(c, text, mode) {
+async function mentorSend(c, text, mode, viaVoice) {
   const l = S.lesson, m = l.mentor; if (l.mentorBusy || text.trim().length < 2) return;
   l.mentorMode = mode; l.mentorBusy = true; l.mentorErr = ''; l.mentorDraft = ''; m.messages.push({ role: 'user', content: text.trim() }); paintMentor(c);
-  try { const r = await post(`/api/courses/${encodeURIComponent(c.id)}/lessons/${l.n}/mentor`, { message: text.trim(), mode }); m.messages.push({ role: 'assistant', content: r.reply }); m.left = r.left; }
+  try { const r = await post(`/api/courses/${encodeURIComponent(c.id)}/lessons/${l.n}/mentor`, { message: text.trim(), mode }); m.messages.push({ role: 'assistant', content: r.reply }); m.left = r.left; if (viaVoice || (typeof voPrefs === 'function' && voPrefs().speak)) setTimeout(() => voSpeak(r.reply), 50); }
   catch (x) { m.messages.pop(); l.mentorErr = x.message; l.mentorDraft = text.trim(); if (x.status === 429) m.left = 0; }
   l.mentorBusy = false; if (S.lesson === l) paintMentor(c);
 }
@@ -415,6 +418,20 @@ function bindMentor(c) {
   $('#ms').onclick = () => mentorSend(c, q.value, mode());
   q.onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); mentorSend(c, q.value, mode()); } };
   q.oninput = () => { l.mentorDraft = q.value; };
+  const spk = $('#mspk'); if (spk) spk.onchange = () => { const p = voPrefs(); p.speak = spk.checked; voSave(p); };
+  const mic = $('#mmic'); if (mic) {
+    mic.hidden = typeof voCanRecord !== 'function' || !voCanRecord();
+    mic.onclick = async () => {
+      voUnlock(); if (l.mentorRec) { l.mentorRec.stop(); return; }
+      try { l.mentorRec = await voStart({}); } catch (_) { l.mentorErr = 'Please allow the microphone so you can talk with Air Omega.'; paintMentor(c); return; }
+      pgOnCleanup(() => { if (l.mentorRec) l.mentorRec.cancel(); });
+      mic.classList.add('on'); mic.textContent = '⏹';
+      const blob = await l.mentorRec.done; l.mentorRec = null;
+      if (!blob || blob.size < 1200) { if (S.lesson === l) paintMentor(c); return; }
+      mic.disabled = true;
+      try { const text = await voTranscribe(blob); mentorSend(c, text, mode(), true); } catch (x) { l.mentorErr = x.message; if (S.lesson === l) paintMentor(c); }
+    };
+  }
 }
 
 /* ───────────── Assignment: written by Air Omega, answered here, marked and scored by Air Omega ───────────── */
