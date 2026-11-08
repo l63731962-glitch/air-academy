@@ -129,6 +129,10 @@ CREATE TABLE IF NOT EXISTS parent_contacts(
 CREATE TABLE IF NOT EXISTS report_log(key TEXT NOT NULL, week_start TEXT NOT NULL, sent_at TEXT NOT NULL, PRIMARY KEY(key, week_start));
 -- "Talk to Air Omega": the open chat, typed or spoken.
 CREATE TABLE IF NOT EXISTS talk_messages(id BIGSERIAL PRIMARY KEY, uid TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL);
+ALTER TABLE talk_messages ADD COLUMN IF NOT EXISTS meta TEXT NOT NULL DEFAULT '';
+-- Short facts Air Omega keeps about a student (goals, interests). The student can see and delete every one.
+CREATE TABLE IF NOT EXISTS talk_memory(id BIGSERIAL PRIMARY KEY, uid TEXT NOT NULL, note TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS talk_memory_uid ON talk_memory(uid, id);
 CREATE INDEX IF NOT EXISTS talk_messages_uid ON talk_messages(uid, id);
 -- Daily counters for the things that cost money per use (voice replies, listening, playground AI runs).
 CREATE TABLE IF NOT EXISTS ai_usage(uid TEXT NOT NULL, day TEXT NOT NULL, kind TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(uid, day, kind));
@@ -153,7 +157,7 @@ CREATE TABLE IF NOT EXISTS purchase_requests(
 TABLES = ("users", "courses", "enrollments", "otp_codes", "payments", "pending_signups", "progress", "scores", "certificates",
           "class_groups", "class_group_courses", "class_group_members", "purchase_requests", "lesson_images", "image_blocks",
           "mentor_messages", "question_stats", "practice_sets", "xp_events", "board_optins", "prize_awards", "assignments",
-          "assignment_attempts", "parent_contacts", "report_log", "talk_messages", "ai_usage")
+          "assignment_attempts", "parent_contacts", "report_log", "talk_messages", "ai_usage", "talk_memory")
 
 
 def now_iso():
@@ -1829,10 +1833,160 @@ def voice_transcribe():
     return jsonify(text=text[:600])
 
 
+# ---- What Air Omega knows: the whole app, this student, and where they are right now ----
+MEMORY_MAX = 20   # facts Air Omega may keep about one student
+
+
+def app_guide():
+    """A plain-language manual of the app, built from the app's own settings so it can never drift out of date."""
+    rows = db().execute("SELECT id, title, lessons_count FROM courses ORDER BY id").fetchall()
+    tracks = "\n".join(f"- {r['id']} = {r['title']} ({r['lessons_count']} lessons). Playground: {omega.PLAYGROUNDS[r['id']][0]}, {omega.PLAYGROUNDS[r['id']][1]}."
+                       for r in rows if r["id"] in omega.PLAYGROUNDS)
+    n_les = max((r["lessons_count"] for r in rows), default=8)
+    return f"""ABOUT: Open Air Tech Space is a learning app of hands-on tech tracks for beginners, mostly teenagers in Nigeria. There are {len(rows)} tracks. Each track costs a flat NGN {PRICE_NGN:,}, paid once with Flutterwave (card, bank transfer or USSD). The server checks the payment and the track unlocks at once, for life. The price is fixed and cannot be negotiated.
+TRACKS (use these ids in actions):
+{tracks}
+ACCOUNT: sign up with full name, email, date of birth (age 5 or older), gender and a password of 8 to 128 characters with letters and at least one number, then confirm with a 6-digit code emailed to you. Sign in with email and password. If the password is forgotten, use the forgot-password link on the sign-in page to get a code by email.
+DASHBOARD: a card for every track with progress, a search box, filters (All tracks, My tracks, Locked), a progress ring, and buttons: Talk to Air Omega, Project Studio, Parent updates, Class groups (teachers) and Sign out. Tap a card to open the track. Air Omega's round button at the bottom right is on every screen.
+TRACK PAGE (once unlocked): the {n_les} lessons, mark lessons done, notes for each lesson (saved on the device), and buttons: My CA and certificate, Project Studio, Playground, and Practice my weak spots (shown only when questions were missed). A locked track shows a paywall with an Unlock button.
+LESSON PAGE: a story-style explanation with a diagram, key terms, common mistakes and an activity. Then: Listen to this lesson (the browser's free voice), Ask Air Omega (a chat that answers only from the lesson, {MENTOR_DAILY} questions a day, styles Normal / Like I'm 12 / With football), Make a picture (an AI photo about the lesson, {IMAGE_LIMIT} per lesson; a prompt unrelated to the lesson pauses picture making for {BLOCK_SECONDS // 60} minutes), the lesson quiz (retake as often as you like, the best score counts), the assignment (written by Air Omega, answered in the app, marked out of 20 by Air Omega, {ASSIGN_ATTEMPTS} tries, the best counts) and your notes.
+GRADING: CA (continuous assessment) is {W_CA}% of the grade: lesson quizzes {W_QUIZ}% and assignments {W_ASSIGN}%. The final exam is {W_EXAM}%: {EXAM_SIZE} random questions drawn from the lesson quizzes. It opens once every lesson quiz has been taken. The pass mark is {PASS_MARK}% overall. Passing earns a certificate with an ID anyone can verify online. The exam and the certificate are opened from the CA page.
+XP: finishing a lesson 10; a lesson quiz up to 20; an assignment up to 30; the final exam up to 50; weak-spot practice 2 per right answer (up to {PRACTICE_XP_CAP} a day); each Prompt Lab or Agent Lab run 2 (up to 10 a day). Repeating work never earns twice.
+WEAK SPOTS: quizzes and the exam remember the questions you missed. Practice my weak spots makes Air Omega write fresh questions on exactly those ({PRACTICE_DAILY} sets a day). A right answer clears that weak spot. Practice never changes the CA.
+LEADERBOARD: weekly (Monday to Sunday, Lagos time), only inside a class group, and opt-in. It shows first name, last initial and XP. The teacher can give the weekly winner one free track.
+CLASS GROUPS: a teacher creates a group with an ordered list of tracks and shares an invite link. Students join with the link and unlock tracks one step at a time: the first needs no approval, later ones need the teacher's approval through a request. Cards show Ask teacher, Waiting, Not allowed or Not yet. Teachers use a private admin page (the link is shown when the group is made) to approve requests, see students and weekly XP, and give the prize.
+PARENT UPDATES: a student adds a parent or guardian email. The parent confirms from their own inbox, and then gets a short progress email every Monday with a link to stop it.
+PROJECT STUDIO: pick a track and Air Omega designs a practical class project with steps, deliverables and a marking rubric.
+PLAYGROUNDS: every unlocked track has one (see the track list). Six run in the browser for free. The Prompt Lab and Agent Lab use AI.
+TALK TO AIR OMEGA: the round button. Type or talk, hear answers in a chosen voice (11 Air Omega voices or free device voices), Conversation mode is hands-free. Air Omega remembers a few useful facts about the student, who can see and delete them with the brain button. Needs an unlocked track.
+DAILY LIMITS: {TALK_DAILY} chat messages, {SPEAK_DAILY} spoken replies, {LISTEN_DAILY} voice messages, {PLAY_DAILY} Prompt Lab / Agent Lab runs, {PRACTICE_DAILY} practice sets, {MENTOR_DAILY} lesson-chat questions. Limits reset at midnight Lagos time.
+COMMON HELP: if a payment went through but the track is still locked, reopen the track (the server verifies it). If the microphone does not work, allow it in the browser and use https. Voice replies falling back to the device voice means the AI voice limit or service is unavailable."""
+
+
+def where_text(uid, where):
+    """Where the student is in the app right now, from the browser. Validated, and lesson text is only added for tracks they own."""
+    names = {"dashboard": "the dashboard (the track cards)", "course": "a track page", "lesson": "a lesson page", "play": "a playground", "ca": "the CA record page",
+             "exam": "the final exam", "cert": "the certificate page", "practice": "weak-spot practice", "projects": "Project Studio", "groups": "the class groups page",
+             "board": "the weekly leaderboard", "parents": "the parent updates page"}
+    where = where if isinstance(where, dict) else {}
+    view = where.get("view") if isinstance(where.get("view"), str) and where.get("view") in names else "dashboard"
+    row = db().execute("SELECT id, title FROM courses WHERE id=?", (where.get("course"),)).fetchone() if isinstance(where.get("course"), str) else None
+    out = f"{names[view]}" + (f" of {row['title']}" if row and view != "dashboard" else "")
+    n = _int_or_none(where.get("lesson"))
+    if row and view == "lesson" and n and n in CONTENT.get(row["id"], {}):
+        out += f", lesson {n}: {LESSONS[row['id']][n - 1]}"
+        if row["id"] in enrolled_ids(uid):
+            out += "\nLESSON TEXT (for questions about this page):\n" + omega.lesson_text(CONTENT[row["id"]][n], 2800)
+    if view == "play" and row:
+        out += f" (the {omega.PLAYGROUNDS[row['id']][0]})"
+    return out
+
+
+def _int_or_none(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def user_state(uid, u):
+    """A short, factual snapshot of this student so Air Omega can say 'continue where you stopped' and mean it."""
+    titles = {r["id"]: (r["title"], r["lessons_count"]) for r in db().execute("SELECT id, title, lessons_count FROM courses").fetchall()}
+    owned = [c for c in enrolled_ids(uid) if c in titles]
+    lines, steps = [f"Name: {u['full_name'] or 'not given'}" + (f" (first name {u['full_name'].split()[0]})" if u["full_name"] else "")], []
+    for cid in owned:
+        title, total = titles[cid]
+        rec, done = ca_record(uid, cid), done_list(uid, cid)
+        weak = len(weak_rows(uid, cid))
+        quizzes = sum(1 for l in rec["lessons"] if l["pct"] is not None)
+        assigns = sum(1 for l in rec["lessons"] if l["assign"] is not None)
+        exam = "passed and certificate earned" if rec["cert"] else (f"taken, {rec['exam']}%" + (", passed" if rec["passed"] else ", not passed yet")) if rec["exam"] is not None else ("not taken (ready to take)" if rec["examReady"] else "not taken (take every lesson quiz first)")
+        lines.append(f"- {title} ({cid}), unlocked: {len(done)} of {total} lessons done; quizzes taken {quizzes}; assignments marked {assigns}; CA {rec['ca']}%; final exam {exam}; weak spots {weak}.")
+        first = next((n for n in range(1, total + 1) if n not in done), None)
+        if first and len(steps) < 4:
+            steps.append(f"Continue {title}: lesson {first}, {LESSONS[cid][first - 1]}")
+        if weak and len(steps) < 4:
+            steps.append(f"Practise {weak} weak spot{'s' if weak != 1 else ''} in {title}")
+        todo = next((l["n"] for l in rec["lessons"] if l["pct"] is not None and l["assign"] is None), None)
+        if todo and len(steps) < 4:
+            steps.append(f"Do the assignment for lesson {todo} of {title}")
+        if rec["examReady"] and rec["exam"] is None and len(steps) < 4:
+            steps.append(f"Take the final exam in {title}")
+        if rec["passed"] and not rec["cert"] and len(steps) < 4:
+            steps.append(f"Get the certificate for {title}")
+    locked = [f"{t} ({c})" for c, (t, _) in titles.items() if c not in owned]
+    lines.append("Locked tracks: " + (", ".join(locked) if locked else "none, all unlocked") + ".")
+    if not owned:
+        steps.append(f"Unlock a first track (NGN {PRICE_NGN:,}) to start learning")
+    week_start = omega.week_bounds()[0]
+    xp = db().execute("SELECT COALESCE(SUM(points),0) t, COALESCE(SUM(CASE WHEN created_at>=? THEN points ELSE 0 END),0) w FROM xp_events WHERE uid=?", (week_start, uid)).fetchone()
+    lines.append(f"XP: {xp['t']} in total, {xp['w']} this week.")
+    grp = group_of(uid)
+    if grp:
+        opted = db().execute("SELECT 1 FROM board_optins WHERE uid=?", (uid,)).fetchone() is not None
+        lines.append(f"Class group: {grp['name']}; weekly leaderboard: {'joined' if opted else 'not joined'}.")
+    else:
+        lines.append("Class group: none.")
+    parents = db().execute("SELECT COUNT(*) c FROM parent_contacts WHERE uid=? AND confirmed_at<>'' AND stopped_at=''", (uid,)).fetchone()["c"]
+    lines.append(f"Parent updates: {parents} parent(s) confirmed.")
+    left = ai_status(uid)["left"]
+    lines.append(f"Today's allowance left: chat {left['talk']}, spoken replies {left['speak']}, voice messages {left['listen']}, lab runs {left['play']}.")
+    lines.append("Suggested next steps: " + ("; ".join(steps) if steps else "nothing urgent, keep exploring a playground") + ".")
+    return "\n".join(lines)
+
+
+def memory_get(uid):
+    return db().execute("SELECT id, note FROM talk_memory WHERE uid=? ORDER BY id", (uid,)).fetchall()
+
+
+def memory_add(uid, notes):
+    have = [r["note"].lower() for r in memory_get(uid)]
+    added = 0
+    for n in notes:
+        if n.lower() in have:
+            continue
+        db().execute("INSERT INTO talk_memory(uid,note,created_at) VALUES(?,?,?)", (uid, n, now_iso()))
+        have.append(n.lower())
+        added += 1
+    db().execute("DELETE FROM talk_memory WHERE uid=? AND id NOT IN (SELECT id FROM talk_memory WHERE uid=? ORDER BY id DESC LIMIT ?)", (uid, uid, MEMORY_MAX))
+    db().commit()
+    return added
+
+
+@app.get("/api/talk/memory")
+@login_required
+def talk_memory_get():
+    return jsonify(notes=memory_get(g.user["uid"]), limit=MEMORY_MAX)
+
+
+@app.post("/api/talk/memory/forget")
+@login_required
+def talk_memory_forget():
+    b = request.get_json(silent=True) or {}
+    if b.get("all") is True:
+        db().execute("DELETE FROM talk_memory WHERE uid=?", (g.user["uid"],))
+    elif isinstance(b.get("id"), int):
+        db().execute("DELETE FROM talk_memory WHERE uid=? AND id=?", (g.user["uid"], b["id"]))
+    else:
+        return err("Choose what to forget.")
+    db().commit()
+    return jsonify(notes=memory_get(g.user["uid"]))
+
+
 # ---- Talk to Air Omega: an open conversation ----
 def talk_state(uid):
-    rows = db().execute("SELECT role, content FROM (SELECT id, role, content FROM talk_messages WHERE uid=? ORDER BY id DESC LIMIT 40) t ORDER BY id", (uid,)).fetchall()
-    return {"intro": omega.AIR_INTRO, "limit": TALK_DAILY, "left": max(0, TALK_DAILY - usage_used(uid, "talk")), "messages": rows}
+    rows = db().execute("SELECT role, content, meta FROM (SELECT id, role, content, meta FROM talk_messages WHERE uid=? ORDER BY id DESC LIMIT 40) t ORDER BY id", (uid,)).fetchall()
+    msgs = []
+    for r in rows:
+        m = {"role": r["role"], "content": r["content"]}
+        if r["meta"]:
+            try:
+                meta = json.loads(r["meta"])
+                m["actions"], m["suggest"] = meta.get("actions", []), meta.get("suggest", [])
+            except ValueError:
+                pass
+        msgs.append(m)
+    return {"intro": omega.AIR_INTRO, "limit": TALK_DAILY, "left": max(0, TALK_DAILY - usage_used(uid, "talk")), "messages": msgs}
 
 
 @app.get("/api/talk")
@@ -1855,26 +2009,35 @@ def talk_send():
     spoken, uid = bool(b.get("voice")), g.user["uid"]
     if usage_used(uid, "talk") >= TALK_DAILY:
         return err(f"You have used your {TALK_DAILY} messages to Air Omega for today. Come back tomorrow.", 429)
-    history = talk_state(uid)["messages"][-12:]
+    history = []
+    for m in talk_state(uid)["messages"][-12:]:   # earlier answers are shown to the model in the same JSON shape it must reply in
+        history.append({"role": "assistant", "content": json.dumps({"say": m["content"], "actions": m.get("actions", [])})} if m["role"] == "assistant" else {"role": "user", "content": m["content"]})
+    courses = {r["id"]: r["lessons_count"] for r in db().execute("SELECT id, lessons_count FROM courses").fetchall()}
     titles = [r["title"] for r in db().execute("SELECT title FROM courses ORDER BY id").fetchall()]
-    system = omega.talk_system(titles, voice=spoken, context=context)
+    system = omega.talk_system(titles, voice=spoken, context=context, guide=app_guide(), state=user_state(uid, g.user),
+                               where=where_text(uid, b.get("where")), memory=[r["note"] for r in memory_get(uid)])
     release_db()
     if flagged(msg):
         return err("I can only help with learning and friendly chat. Try asking in a different way.", 422)
     try:
-        reply = openai_chat([{"role": "system", "content": system}, *history, {"role": "user", "content": msg}],
-                            smart=True, temperature=0.6, max_tokens=350 if spoken else 800, timeout=45).strip()[:3000]
-        if not reply:
-            raise ValueError("empty reply")
+        parsed = omega.parse_talk_reply(openai_chat([{"role": "system", "content": system}, *history, {"role": "user", "content": msg}], smart=True, json_mode=True,
+                                                    temperature=0.6, max_tokens=700 if spoken else 1400, timeout=50))
+        if parsed is None:
+            raise ValueError("unusable reply")
     except Exception:
         log.exception("talk reply failed")
         return err("Air Omega could not answer right now. That did not use up a message. Please try again.", 502)
-    now = now_iso()
-    for role, text in (("user", msg), ("assistant", reply)):
-        db().execute("INSERT INTO talk_messages(uid,role,content,created_at) VALUES(?,?,?,?)", (uid, role, text, now))
+    actions, suggest = omega.clean_actions(parsed["actions"], courses), omega.clean_suggest(parsed["suggest"], courses)
+    say = parsed["say"][:3000] or ("Done." if actions else "")
+    if not say:
+        return err("Air Omega could not answer right now. That did not use up a message. Please try again.", 502)
+    now, meta = now_iso(), json.dumps({"actions": actions, "suggest": suggest}) if (actions or suggest) else ""
+    for role, text, mt in (("user", msg, ""), ("assistant", say, meta)):
+        db().execute("INSERT INTO talk_messages(uid,role,content,created_at,meta) VALUES(?,?,?,?,?)", (uid, role, text, now, mt))
     db().commit()
     usage_add(uid, "talk")
-    return jsonify(reply=reply, left=max(0, TALK_DAILY - usage_used(uid, "talk")), limit=TALK_DAILY)
+    saved = memory_add(uid, omega.clean_memory(parsed["remember"]))
+    return jsonify(reply=say, actions=actions, suggest=suggest, remembered=saved, left=max(0, TALK_DAILY - usage_used(uid, "talk")), limit=TALK_DAILY)
 
 
 @app.post("/api/talk/clear")
