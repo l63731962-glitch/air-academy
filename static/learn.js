@@ -27,7 +27,7 @@ function rich(t) {
 /* ───────────── Sign in / create account ───────────── */
 let resendTimer;
 function renderLogin(mode = 'signin', d = {}) {
-  clearInterval(resendTimer); closeSheet();
+  clearInterval(resendTimer); closeSheet(); if (typeof airDock !== 'undefined') airDock.hide();
   const today = new Date().toISOString().slice(0, 10);
   const inp = (id, label, type = 'text', ac = '', more = '') => `<label for="${id}">${label}</label><input id="${id}" type="${type}" autocomplete="${ac}" ${more}>`;
   const pass = (id, label, ac) => `<label for="${id}">${label}</label><div class="pw"><input id="${id}" type="password" autocomplete="${ac}"><button type="button" class="eye" data-for="${id}">Show</button></div>`;
@@ -351,7 +351,7 @@ function paintListen() {
 }
 
 function stopListening() {
-  if (canSpeak()) { speechSynthesis.resume(); speechSynthesis.cancel(); }
+  if (canSpeak() && listening) { speechSynthesis.resume(); speechSynthesis.cancel(); }   // only the lesson reading: Air Omega's own voice must not be cut off by a screen change
   listening = null; paintListen();
 }
 
