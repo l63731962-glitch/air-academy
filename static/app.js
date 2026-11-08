@@ -105,6 +105,7 @@ function renderDashboard(animate = true) {
   </div>
   <section class="grid" id="grid"></section>`;
   renderGrid(animate);
+  if (typeof airDock !== 'undefined') airDock.show();
   $('#q').oninput = (ev) => { S.q = ev.target.value; renderGrid(); };
   $('#app').querySelectorAll('.seg button').forEach((b) => (b.onclick = () => {
     S.filter = b.dataset.f;
