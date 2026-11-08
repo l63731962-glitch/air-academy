@@ -3,7 +3,8 @@
 const PG = {};                          // one playground per course id, filled in further down
 const pgCleanups = [];
 const pgOnCleanup = (fn) => pgCleanups.push(fn);
-function pgCleanup() { while (pgCleanups.length) { try { pgCleanups.pop()(); } catch (_) {} } voStop(); }
+let pgRun = null, voDockSpeaking = false;   // the open playground, and whether the floating Air Omega is speaking (it must not be cut off by a screen change)
+function pgCleanup() { pgRun = null; while (pgCleanups.length) { try { pgCleanups.pop()(); } catch (_) {} } if (!voDockSpeaking) voStop(); }
 
 /* ───────────── Voice: Air Omega speaks (and listens) ───────────── */
 const VO_KEY = 'oats:voice';
@@ -140,26 +141,36 @@ function pgFmt(t) {
 }
 
 async function pgChat(el, cfg) {
-  const ch = { messages: [], left: 0, limit: 0, busy: false, rec: null, hearing: false, speaking: false, conv: false, err: '', draft: '', ai: null, intro: '' };
-  let gone = false; pgOnCleanup(() => { gone = true; if (ch.rec) ch.rec.cancel(); });
+  const ch = { messages: [], left: 0, limit: 0, busy: false, rec: null, hearing: false, speaking: false, conv: false, err: '', ai: null, intro: '' };
+  let gone = false; if (!cfg.persist) pgOnCleanup(() => { gone = true; if (ch.rec) ch.rec.cancel(); });   // the floating dock chat is not tied to a screen
   el.innerHTML = '<p class="meta" style="padding:14px 0">Loading…</p>';
-  try { const d = await api(cfg.url); ch.messages = d.talk.messages; ch.left = d.talk.left; ch.limit = d.talk.limit; ch.intro = d.talk.intro; ch.ai = d.ai; voAI = d.ai; }
-  catch (x) { el.innerHTML = `<p class="err">${esc(x.message)}</p>`; return null; }
+  const load = async () => { const d = await api(cfg.url); ch.messages = d.talk.messages; ch.left = d.talk.left; ch.limit = d.talk.limit; ch.intro = d.talk.intro; ch.ai = d.ai; voAI = d.ai; };
+  try { await load(); } catch (x) { el.innerHTML = `<p class="err">${esc(x.message)}</p>`; return null; }
   if (gone) return null;
   if (!ch.ai.unlocked || !ch.ai.on) { el.innerHTML = `<p class="meta">${!ch.ai.unlocked ? 'Unlock a track to talk with Air Omega.' : 'Air Omega is not switched on yet.'}</p>`; return null; }
 
-  el.innerHTML = `<div class="pgchat ${cfg.compact ? 'compact' : ''}"><p class="meta c-left"></p><div class="mchat c-msgs" aria-live="polite"></div><p class="c-status meta"></p><p class="err c-err"></p>
+  const settings = `${voiceSettingsHTML(ch.ai)}<div class="vopts"><label class="vchk"><input type="checkbox" class="c-conv"> Conversation mode (hands-free)</label><button class="pill c-new">New chat</button></div>`;
+  el.innerHTML = `<div class="pgchat ${cfg.compact ? 'compact' : ''}"><p class="meta c-left"></p><div class="mchat c-msgs" aria-live="polite"></div>
+    ${cfg.quick ? '<div class="pills c-quick"></div>' : ''}<p class="c-status meta"></p><p class="err c-err"></p>
     <div class="m-row"><button class="mic c-mic" aria-label="Talk to Air Omega">🎤</button><textarea class="c-q" rows="2" maxlength="600" aria-label="Your message" placeholder="${esc(cfg.placeholder || 'Type a message, or tap the microphone and talk')}"></textarea><button class="btn c-send">SEND</button></div>
-    ${voiceSettingsHTML(ch.ai)}<div class="vopts"><label class="vchk"><input type="checkbox" class="c-conv"> Conversation mode (hands-free)</label><button class="pill c-new">New chat</button></div></div>`;
+    ${cfg.compact ? `<details class="vset"><summary>⚙ Voice and chat settings</summary>${settings}</details>` : settings}</div>`;
   const $$ = (s) => el.querySelector(s), msgs = $$('.c-msgs'), q = $$('.c-q'), mic = $$('.c-mic'), send = $$('.c-send');
+  const ctxNow = () => (cfg.context ? cfg.context() : typeof airContext === 'function' ? airContext() : '');
+  const whereNow = () => (cfg.where ? cfg.where() : typeof airWhere === 'function' ? airWhere() : {});
+  const lastBot = () => { for (let i = ch.messages.length - 1; i >= 0; i--) if (ch.messages[i].role === 'assistant') return i; return -1; };
 
   const paintMsgs = () => {
-    msgs.innerHTML = bubble('assistant', ch.intro + (cfg.intro || ' Ask me anything, or tap the microphone and talk to me.')) + ch.messages.map((m, i) =>
-      m.role === 'user' ? bubble('user', m.content).replace('class="bub me"', 'class="bub me"')
-        : `<div class="bub bot"><small>Air Omega</small>${pgFmt(m.content)}<button class="say" data-say="${i}" aria-label="Hear this answer">🔊</button></div>`).join('')
-      + (ch.busy ? '<div class="bub bot"><small>Air Omega</small><span class="dots"><i></i><i></i><i></i></span></div>' : '');
+    const sugAt = lastBot();
+    msgs.innerHTML = bubble('assistant', ch.intro + (cfg.intro || ' Ask me anything, or tap the microphone and talk to me.')) + ch.messages.map((m, i) => {
+      if (m.role === 'user') return bubble('user', m.content);
+      const chips = (m.actions || []).map((a) => `<span class="achip">${esc(typeof airLabel === 'function' ? airLabel(a) : a.type)}</span>`).join('') + (m.remembered ? '<span class="achip mem">🧠 Remembered</span>' : '');
+      const sug = i === sugAt && (m.suggest || []).length ? `<div class="asug">${m.suggest.map((s, k) => `<button class="pill hot" data-sug="${i}:${k}">${esc(s.label)}</button>`).join('')}</div>` : '';
+      return `<div class="bub bot"><small>Air Omega</small>${pgFmt(m.content)}${chips ? `<div class="achips">${chips}</div>` : ''}${sug}<button class="say" data-say="${i}" aria-label="Hear this answer">🔊</button></div>`;
+    }).join('') + (ch.busy ? '<div class="bub bot"><small>Air Omega</small><span class="dots"><i></i><i></i><i></i></span></div>' : '');
     msgs.scrollTop = msgs.scrollHeight;
-    msgs.querySelectorAll('[data-say]').forEach((b) => (b.onclick = async () => { voUnlock(); ch.speaking = true; paintState(); await voSpeak(ch.messages[+b.dataset.say].content); ch.speaking = false; paintState(); }));
+    msgs.querySelectorAll('[data-say]').forEach((b) => (b.onclick = async () => { voUnlock(); await speakOut(ch.messages[+b.dataset.say].content); }));
+    msgs.querySelectorAll('[data-sug]').forEach((b) => (b.onclick = () => { const [i, k] = b.dataset.sug.split(':').map(Number); if (typeof airRun === 'function') airRun([ch.messages[i].suggest[k].action]); }));
+    const qk = $$('.c-quick'); if (qk) { qk.hidden = ch.messages.length > 0; if (!qk.children.length) { qk.innerHTML = cfg.quick.map((t, i) => `<button class="pill" data-qk="${i}">${esc(t)}</button>`).join(''); qk.querySelectorAll('button').forEach((b) => (b.onclick = () => { voUnlock(); sendMsg(cfg.quick[+b.dataset.qk], false); })); } }
   };
   const paintState = () => {
     $$('.c-left').textContent = `${ch.left} of ${ch.limit} messages left today.`;
@@ -170,15 +181,28 @@ async function pgChat(el, cfg) {
     mic.hidden = !voCanRecord(); send.disabled = ch.busy || ch.left <= 0; q.disabled = ch.left <= 0;
     $$('.c-conv').checked = ch.conv;
   };
+  async function speakOut(text) {   // the dock keeps talking even while the screen behind it changes
+    ch.speaking = true; if (cfg.persist) voDockSpeaking = true; paintState();
+    try { await voSpeak(text); } finally { ch.speaking = false; if (cfg.persist) voDockSpeaking = false; if (!gone) paintState(); }
+  }
 
   async function sendMsg(text, viaVoice) {
     text = text.trim(); if (text.length < 2 || ch.busy) return;
     const speak = viaVoice || voPrefs().speak;
-    ch.busy = true; ch.err = ''; ch.draft = ''; q.value = ''; ch.messages.push({ role: 'user', content: text }); paintMsgs(); paintState();
+    const quick = typeof airQuick === 'function' ? airQuick(text, typeof airCtx === 'function' ? airCtx() : {}) : null;
+    if (quick) {   // a plain "open the cloud playground" is done at once: instant, and no AI call is spent
+      q.value = ''; ch.err = ''; ch.messages.push({ role: 'user', content: text }, { role: 'assistant', content: quick.say, actions: quick.actions }); paintMsgs(); paintState();
+      await airRun(quick.actions);
+      if (speak && !gone && !quick.actions.some((a) => a.type === 'listen')) await speakOut(quick.say);
+      if (ch.conv && !gone) listen(true);
+      return;
+    }
+    ch.busy = true; ch.err = ''; q.value = ''; ch.messages.push({ role: 'user', content: text }); paintMsgs(); paintState();
     try {
-      const r = await post(cfg.url, { message: text, context: cfg.context ? cfg.context() : '', voice: !!speak });
-      ch.messages.push({ role: 'assistant', content: r.reply }); ch.left = r.left; ch.busy = false; paintMsgs(); paintState();
-      if (speak && !gone) { ch.speaking = true; paintState(); await voSpeak(r.reply); ch.speaking = false; paintState(); }
+      const r = await post(cfg.url, { message: text, context: ctxNow(), where: whereNow(), voice: !!speak });
+      ch.messages.push({ role: 'assistant', content: r.reply, actions: r.actions || [], suggest: r.suggest || [], remembered: r.remembered || 0 }); ch.left = r.left; ch.busy = false; paintMsgs(); paintState();
+      if ((r.actions || []).length && typeof airRun === 'function') await airRun(r.actions);
+      if (speak && !gone && !(r.actions || []).some((a) => a.type === 'listen')) await speakOut(r.reply);
       if (ch.conv && !gone) listen(true);
     } catch (x) { ch.messages.pop(); ch.err = x.message; ch.busy = false; ch.conv = false; q.value = text; paintMsgs(); paintState(); }
   }
@@ -204,14 +228,21 @@ async function pgChat(el, cfg) {
   $$('.v-speak').onchange = (e) => { const p = voPrefs(); p.speak = e.target.checked; voSave(p); };
   $$('.v-voice').onchange = (e) => { const p = voPrefs(); p.voice = e.target.value; voSave(p); };
   $$('.v-rate').onchange = (e) => { const p = voPrefs(); p.rate = +e.target.value; voSave(p); };
-  $$('.v-test').onclick = async () => { voUnlock(); await voSpeak(ch.intro); };
+  $$('.v-test').onclick = async () => { voUnlock(); await speakOut(ch.intro); };
   if (canSpeak()) speechSynthesis.onvoiceschanged = () => { const sel = $$('.v-voice'); if (sel && !gone) { const keep = voPrefs().voice; const tmp = document.createElement('div'); tmp.innerHTML = voiceSettingsHTML(ch.ai); sel.innerHTML = tmp.querySelector('.v-voice').innerHTML; sel.value = keep; } };
   paintMsgs(); paintState();
-  return { say: sendMsg };
+  return {
+    say: sendMsg,
+    async refresh() { try { await load(); if (!gone) { paintMsgs(); paintState(); } } catch (_) {} },
+    pause() { ch.conv = false; if (ch.rec) ch.rec.cancel(); if (!gone) paintState(); },
+    destroy() { gone = true; ch.conv = false; if (ch.rec) ch.rec.cancel(); if (cfg.persist) voDockSpeaking = false; voStop(); },
+    syncVoice() { const p = voPrefs(), a = $$('.v-voice'), b = $$('.v-speak'), c = $$('.v-rate'); if (a) a.value = p.voice; if (b) b.checked = p.speak; if (c) c.value = String(p.rate); },
+    setConversation(on) { const cb = $$('.c-conv'); if (cb) { cb.checked = !!on; cb.dispatchEvent(new Event('change', { bubbles: true })); } },
+  };
 }
 
 /* ───────────── Talk to Air Omega (a screen of its own) ───────────── */
-function openTalk() { S.openId = null; S.view = 'talk'; $('#sheet').hidden = false; document.body.classList.add('lock'); renderSheet(); }
+function openTalk() { if (typeof airDock !== 'undefined') airDock.open(); }
 
 function viewTalk() {
   sheet(`<div class="glass intro"><h2>Talk to Air Omega</h2><p>Ask about tech, coding, your courses or your homework. Type, or tap the microphone and just talk. Air Omega can talk back in the voice you choose.</p></div>
@@ -228,7 +259,7 @@ function viewPlay(c) {
   sheet(`<div class="glass intro"><h2>${pg.icon} ${esc(pg.name)}</h2><p>${esc(pg.blurb)}</p></div>
     <div class="pg" id="pgbox"></div>
     <div class="glass panel"><h3>Ask Air Omega about your work</h3><p class="meta">Air Omega can see what you have built here, so it can explain, fix and improve it with you.</p><div id="pgchat"></div></div>`, () => goView('course'), '← Back to lessons');
-  const run = pg.mount($('#pgbox'), c);
+  const run = pg.mount($('#pgbox'), c); pgRun = run;
   pgChat($('#pgchat'), { url: '/api/talk', context: () => (run && run.context ? run.context() : ''), compact: true, placeholder: 'Ask about what you just built…', intro: ' Ask me about anything you are building in this playground.' });
 }
 
