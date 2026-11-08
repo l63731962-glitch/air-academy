@@ -45,6 +45,15 @@ Every AI feature speaks as **Air Omega, Open Air Tech Space AI assistant**. All 
 - **Playgrounds** (button on every unlocked course): Prompt Engineering has the **Prompt Lab** (runs a real prompt, Air Omega scores it), Web Development has the **Code Studio** (live HTML, CSS and JavaScript), Animation has the **Keyframe Studio**, Cloud Computing has the **Traffic Surge Simulator**, App Development has the **Screen Builder**, Full Stack has the **API Lab** (a pretend backend in the browser), Agentic AI has the **Agent Lab** (a real agent with tools the student chooses) and Game Development has the **Game Tuner**. In every playground, Air Omega can see what the student has built and helps with it.
 - Only the Prompt Lab and Agent Lab, voice and chat use OpenAI. The other six run entirely in the browser and cost nothing.
 
+## Air Omega knows the app and can open anything
+Air Omega is the round button at the bottom right of every screen (and the "Talk to Air Omega" button on the dashboard). It stays on screen while the app changes behind it.
+- **It knows the whole app.** Every message carries a manual that is built from the app's own settings (price, grading weights, limits, tracks, playgrounds), so it cannot go out of date. It also knows the student: their tracks and progress, quiz and weak-spot counts, assignments, exam and certificate status, XP, class group and what to do next. And it knows which screen they are on, including the lesson text and whatever they built in a playground.
+- **It can open and set up anything.** Say or type "open Prompt Engineering", "go to lesson 3 of Animation", "open my CA", "show locked tracks", "open the leaderboard", "read this lesson", "change your voice to Nova", or "set up the traffic simulator for a viral spike with 4 medium servers". Simple commands like these are understood in the browser, instantly, with no AI call. Anything more complicated goes to the AI, which answers with actions.
+- **Every action is checked.** The AI only proposes actions as JSON. The server checks each one against a fixed list (known track ids, lessons 1 to 8, whitelisted playground settings) and drops anything else. It can never pay, unlock a track, or sign anyone out by itself: signing out is only offered as a button the student taps and confirms.
+- **Suggestions.** Air Omega can offer buttons for the best next steps, and the student taps one to do it.
+- **Memory.** Air Omega can keep up to 20 short facts about a student's goals and interests, so it helps better next time. It never keeps contact details, links, passwords or addresses. The brain button in the panel shows every fact, and the student can delete one or all of them.
+- On a phone the panel steps aside after it opens something, so the student can see it. Tap the button to bring it back.
+
 ## Weekly emails
 Emails go out when something calls the trigger. Two ways, pick one:
 1. **Free scheduler (cron-job.org).** Create a job that sends a `POST` to `https://YOUR-DOMAIN/api/internal/weekly-reports` every Monday morning, with the header `X-Cron-Secret: <your CRON_SECRET>`. It answers at once and sends the emails in the background.
@@ -60,6 +69,7 @@ Sign in, open a locked course, tap **Unlock**, and use a Flutterwave test card f
 
 ## Files
 - `app.py`: API, OTP auth, payment init/verify/webhook, SQLite schema
+- `assistant.js`: Air Omega everywhere: the floating panel, quick commands, the actions it can run, and the memory panel
 - `playgrounds.js`: voice, the Talk screen and the eight playgrounds
 - `omega.py`: Air Omega's prompts, checks on AI answers, week maths and email text (no database in it)
 - `send_weekly_reports.py`: run once a week to send the progress emails
