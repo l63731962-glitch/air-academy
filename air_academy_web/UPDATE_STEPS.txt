@@ -1,49 +1,96 @@
-AIR ACADEMY: ANIMATION TRACKS + FREE LESSONS + PAYWALL UPDATE
-=============================================================
+AIR ACADEMY: STRIPE PAYMENTS + LIVE USERS + CONTROL ROOM UPDATE
+===============================================================
 
 WHAT YOU GET
-- 3 new tracks (classes 9, 10, 11), 5 lessons each:
-    2D Animation Fundamentals
-    3D Animation Mastery
-    AI Animation and Storytelling
-- Everything is locked except lessons 1 and 2 of AI Prompt Engineering.
-- Paywall pop-up, lock badges, syllabus sidebar, "Continue to Lesson N" button.
-- Dashboard topic tabs: All / 2D Animation / 3D Animation / AI Animation.
-- Price is now 4,000 naira per course (one track = one payment, no all-access pass).
-- New playgrounds: 2D (Keyframe Studio with frame counter), 3D (Camera and Light Studio),
-  AI (Scene and Storyline Playground).
-- Your old courses and your students' access are NOT touched.
+- Stripe checkout instead of Flutterwave (Flutterwave keeps working until you add Stripe keys,
+  so no sale is lost while you set Stripe up).
+- A green "N live - Control Room" button on YOUR dashboard only. It shows how many people are
+  using the app right now (one person = 1, two = 2, and so on), refreshed every few seconds.
+- The Control Room (only your email can open it): live users, an OpenAI/Resend/Supabase/Render
+  cost meter with warnings and email alerts, this month's bill and projection, a "what if I had
+  1,000 students" slider, sales, sign-ups, a launch checklist, and a tool to give a student a track.
+- Your students' accounts, courses and payments are NOT touched. New tables are added by
+  themselves when the app starts.
 
-STEP 1. COPY THE FILES (PowerShell)
-Open PowerShell inside your project folder (the one that has app.py), then run:
+STEP 1. COPY THE FILES (PowerShell, inside the folder that has app.py)
 
-    Expand-Archive -Path "$HOME\Downloads\air_academy_animation_tracks.zip" -DestinationPath . -Force
+    Expand-Archive -Path "$HOME\Downloads\air_academy_stripe_control_room.zip" -DestinationPath . -Force
 
-(Change the path if the zip is not in Downloads.)
-This replaces app.py, omega.py, courses_seed.py, course_content.py, README.md and the static
-folder, and adds 3 new lesson files. It does not touch your .env or your database.
+This adds billing.py, control.py, static/live.js, static/owner.js and replaces app.py, omega.py,
+README.md and the static files. It does not touch your .env, your database or your lesson files.
 
-STEP 2. CHECK ON YOUR COMPUTER (optional but recommended)
-Add this line to your local .env file (NOT on Render):
+STEP 2. RENDER SETTINGS (Dashboard > your service > Environment)
+Add this first. It turns on the live counter and Control Room for you only:
 
-    DEMO_UNLOCK=1
+    OWNER_EMAILS = your-own-gmail-address@gmail.com   (the Gmail you sign in with)
 
-Then run:   python app.py
-Open http://127.0.0.1:5000 , sign in, and you will see a "Demo Unlock Pro" button.
-It opens every course on your computer only, so you can look at all the paid screens.
-It never saves anything and it cannot work on Render.
+Type your real address here on Render only. It is deliberately not in the code or in this file, because your code is on public GitHub.
+Also check: APP_ENV=production, and DEMO_UNLOCK must NOT exist.
 
-STEP 3. PUT IT ON RENDER
+Settings > Start Command (so one slow OpenAI answer does not freeze everybody else):
+
+    gunicorn app:app --workers 2 --threads 4 --timeout 120
+
+STEP 3. PUSH
+
     git add .
-    git commit -m "Add 2D, 3D and AI animation tracks, free lessons and paywall"
+    git commit -m "Stripe payments, live users and Control Room"
     git push
 
-Render rebuilds by itself. The 3 new courses are added to your database automatically when the
-app starts. Do NOT add DEMO_UNLOCK on Render. Keep APP_ENV=production there.
+Render rebuilds. Sign in with your Gmail: you will see the green Control Room button.
 
-IF YOU CHANGE THE FREE LESSONS OR PRICE LATER
-Both are at the top of app.py:
-    PRICE_NGN = 4000
-    FREE_LESSONS = {"prompt-engineering": 2}
-(Also change `const PRICE = 4000;` at the top of static/app.js so the screen shows the same number.)
-Payments of 3,500 that were already started before the update are still accepted.
+STEP 4. OPEN THE CONTROL ROOM > PLANS
+Tell it what you really pay (Render plan, Supabase plan, Resend plan, how much OpenAI you are
+willing to spend, naira per dollar). Pick a plan from each list or type your own numbers, then Save.
+Until you do, it uses free-plan defaults and the warnings will not match your real bill.
+Then press "Send a test alert" and confirm the email reaches you (check spam).
+
+STEP 5. STRIPE (test mode first)
+READ THIS FIRST: Stripe does not support businesses registered in Nigeria directly. Naira card and
+bank-transfer payments are an invite-only Stripe preview, and only for accounts outside Nigeria
+(paid out in dollars). Check what your Stripe account allows before you rely on it. Stripe also keeps
+a fixed 30 cents per sale, which is a big part of a 4,000 naira sale (about $2.4).
+
+When you are ready:
+ 1. Stripe dashboard: switch on Test mode. Copy the secret key (sk_test_...).
+ 2. Render > Environment, add:
+        STRIPE_SECRET_KEY = sk_test_...
+        STRIPE_CURRENCY   = ngn          (or usd, or whatever your account supports)
+        STRIPE_AMOUNT     = 4000         (the price in that currency, e.g. 2.99 for USD)
+ 3. Stripe > Developers > Webhooks > Add endpoint:
+        URL:    https://YOUR-SITE.onrender.com/api/stripe/webhook
+        Events: checkout.session.completed
+                checkout.session.async_payment_succeeded
+                checkout.session.async_payment_failed
+                checkout.session.expired
+                charge.refunded
+                charge.dispute.created
+ 4. Copy the signing secret (whsec_...) to Render:
+        STRIPE_WEBHOOK_SECRET = whsec_...
+ 5. Test: sign in with a different email, tap Unlock, pay with card 4242 4242 4242 4242 (any future
+    date, any CVC). The track should unlock when you come back. In the Control Room > Setup check
+    you should see "Stripe webhook heard from Stripe".
+ 6. Go live: replace the key with sk_live_... and the webhook secret with the live one.
+    (The Control Room warns you if a test key is left on a live site.)
+
+Which payment methods appear (cards, bank transfer...) is set in Stripe > Settings > Payment
+methods. No code change needed. Refunds are done in the Stripe dashboard: a full refund takes the
+track back automatically.
+
+HOW THE LIVE COUNT WORKS
+Every open tab pings the server every 30 seconds. Someone counts for 75 seconds after their last
+ping. A hidden tab or a phone put down drops off within about a minute. You are not counted (so you
+do not inflate it). To test it, open the app in a private window WITHOUT signing in: you appear as
+a visitor. Or tap "Count me too" in the Live section.
+
+ABOUT THE COST NUMBERS
+They are estimates. OpenAI is counted from tokens at the public price list, so compare with
+platform.openai.com now and then. Render, Supabase and Resend use the plans you enter. The
+"what if" slider assumes about 30 cents of AI per active student a month until you have 10 active
+students; after that it uses what your real students actually cost.
+
+IF SOMETHING LOOKS WRONG
+- No green button: the OWNER_EMAILS value must match the email you sign in with exactly (capitals
+  do not matter). Render restarts after you change it.
+- "Stripe problem" shown in the Control Room: it shows Stripe's own error message.
+- Payments of the old kind (Flutterwave) that are already in your database still count as revenue.
