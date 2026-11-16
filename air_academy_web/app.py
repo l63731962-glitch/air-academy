@@ -1,4 +1,4 @@
-"""Open Air Tech Space: Flask backend. Accounts (name, date of birth, gender, password) verified by email code (sent through Resend), progress, quizzes, CA record, exams, certificates, project studio + Flutterwave paywall (4,000 NGN per course; some lessons are free previews)."""
+"""Open Air Tech Space: Flask backend. Accounts (name, date of birth, gender, password) verified by email code (sent through Resend), progress, quizzes, CA record, exams, certificates, project studio + Stripe paywall (4,000 NGN per course; some lessons are free previews), plus an owner-only Control Room (live users, costs, sales)."""
 import base64, hashlib, hmac, json, logging, math, os, random, re, secrets, threading, time, uuid
 from datetime import date, datetime, timedelta, timezone
 from functools import wraps
@@ -14,6 +14,8 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 from course_content import CONTENT, KINDS, RUBRIC, STEPS
 from courses_seed import COURSES, LESSONS, NOTES
+import billing
+import control
 import omega
 
 load_dotenv()
@@ -39,6 +41,23 @@ OTP_TTL, OTP_MAX_ATTEMPTS, RESEND_SECONDS = 600, 5, 60
 
 log = logging.getLogger("academy")
 logging.basicConfig(level=logging.INFO)
+
+# Stripe (the payment provider). Students pay on Stripe's own checkout page, so no card details ever reach this server.
+#   STRIPE_SECRET_KEY      sk_live_... (or sk_test_... while testing)
+#   STRIPE_WEBHOOK_SECRET  whsec_...   from the webhook you add in the Stripe Dashboard
+#   STRIPE_CURRENCY        ngn (default) or usd, gbp, eur...      STRIPE_AMOUNT  price in that currency (default 4000 for ngn)
+# While STRIPE_SECRET_KEY is not set the older Flutterwave keys keep working, so selling never stops during the switch.
+STRIPE_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
+STRIPE_WHSEC = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
+STRIPE_CURRENCY = (os.getenv("STRIPE_CURRENCY", "ngn").strip() or "ngn").lower()
+try:
+    STRIPE_MINOR = billing.price_minor(os.getenv("STRIPE_AMOUNT") or (PRICE_NGN if STRIPE_CURRENCY == "ngn" else ""), STRIPE_CURRENCY)
+except ValueError:
+    STRIPE_MINOR = 0
+    if STRIPE_KEY:
+        log.error("Stripe is not usable: set STRIPE_CURRENCY to a supported currency, and STRIPE_AMOUNT (the price in that currency) unless it is ngn.")
+# The Control Room (live users, costs, sales) is for these accounts only: full email addresses, comma separated. Empty = nobody.
+OWNER_EMAILS = {e.strip().lower() for e in os.getenv("OWNER_EMAILS", "").split(",") if e.strip()}
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 _secret = os.getenv("SECRET_KEY")
@@ -161,12 +180,38 @@ CREATE TABLE IF NOT EXISTS purchase_requests(
   status TEXT NOT NULL, created_at TEXT NOT NULL, decided_at TEXT, UNIQUE(uid, course_id));
 """
 
+# Stripe payments and the owner's Control Room. Everything here only adds: old payments (Flutterwave) are kept exactly as they were.
+OWNER_SCHEMA = """
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT 'flutterwave';
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS amount_minor BIGINT;
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS stripe_session_id TEXT;
+ALTER TABLE payments ADD COLUMN IF NOT EXISTS stripe_payment_intent TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS payments_stripe_session ON payments(stripe_session_id) WHERE stripe_session_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS payments_intent ON payments(stripe_payment_intent);
+CREATE INDEX IF NOT EXISTS payments_verified ON payments(verified_at);
+-- Who is online right now (one row per signed-in student, or per visitor on the sign-in page), refreshed by a small heartbeat.
+CREATE TABLE IF NOT EXISTS presence(pid TEXT PRIMARY KEY, uid TEXT, name TEXT NOT NULL DEFAULT '', place TEXT NOT NULL DEFAULT '', seen_at BIGINT NOT NULL);
+CREATE INDEX IF NOT EXISTS presence_seen ON presence(seen_at);
+CREATE TABLE IF NOT EXISTS active_days(day TEXT NOT NULL, uid TEXT NOT NULL, PRIMARY KEY(day, uid));
+CREATE TABLE IF NOT EXISTS live_samples(ts BIGINT PRIMARY KEY, n INTEGER NOT NULL);
+-- One row for each billable thing: an AI call, a voice reply, an email. The meter adds them up.
+CREATE TABLE IF NOT EXISTS usage_log(
+  id BIGSERIAL PRIMARY KEY, ts TEXT NOT NULL, day TEXT NOT NULL, service TEXT NOT NULL, kind TEXT NOT NULL,
+  model TEXT NOT NULL DEFAULT '', qty DOUBLE PRECISION NOT NULL DEFAULT 1, cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0, uid TEXT NOT NULL DEFAULT '');
+CREATE INDEX IF NOT EXISTS usage_log_ts ON usage_log(ts);
+CREATE TABLE IF NOT EXISTS owner_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS owner_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS stripe_events(id TEXT PRIMARY KEY, type TEXT NOT NULL, received_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS owner_audit(id BIGSERIAL PRIMARY KEY, ts TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL);
+"""
+
 # Supabase publishes every table in the public schema through its REST API, which the public "anon" key can reach.
 # Row Level Security with no policies shuts that door. This app talks to Postgres directly as the owner role, which is unaffected.
 TABLES = ("users", "courses", "enrollments", "otp_codes", "payments", "pending_signups", "progress", "scores", "certificates",
           "class_groups", "class_group_courses", "class_group_members", "purchase_requests", "lesson_images", "image_blocks",
           "mentor_messages", "question_stats", "practice_sets", "xp_events", "board_optins", "prize_awards", "assignments",
-          "assignment_attempts", "parent_contacts", "report_log", "talk_messages", "ai_usage", "talk_memory")
+          "assignment_attempts", "parent_contacts", "report_log", "talk_messages", "ai_usage", "talk_memory",
+          "presence", "active_days", "live_samples", "usage_log", "owner_settings", "owner_meta", "stripe_events", "owner_audit")
 
 
 def now_iso():
@@ -228,7 +273,7 @@ def init_db():
     with psycopg.connect(_dsn(), prepare_threshold=None) as con:   # commits when the block ends cleanly, then closes
         # Several workers boot at once. The lock makes them take turns creating tables (it frees itself at commit).
         con.execute("SELECT pg_advisory_xact_lock(727401)")
-        for script in (SCHEMA, EXTRA_SCHEMA, GROUP_SCHEMA):
+        for script in (SCHEMA, EXTRA_SCHEMA, GROUP_SCHEMA, OWNER_SCHEMA):
             con.execute(script)
         for t in TABLES:
             con.execute(f"ALTER TABLE {t} ENABLE ROW LEVEL SECURITY")
@@ -258,6 +303,44 @@ def release_db():
 @app.teardown_appcontext
 def close_db(_exc):
     release_db()
+    flush_usage()   # after the request's own connection is back in the pool, so this never needs a second one at the same time
+
+
+# ───────────────────────── Usage meter (feeds the owner's Control Room) ─────────────────────────
+# Billable things (an AI call, a voice reply, an email) are noted in memory as they happen and written to the database in
+# one go when the request ends. Nothing here can slow down or break a student's request: every failure is swallowed and logged.
+_usage_buf, _usage_lock = [], threading.Lock()
+
+
+def log_usage(service, kind, model="", qty=1.0, cost=0.0, uid=""):
+    try:
+        with _usage_lock:
+            if len(_usage_buf) < 2000:
+                _usage_buf.append((now_iso(), omega.lagos_date(), service, str(kind)[:60], str(model)[:60], float(qty), float(cost), str(uid or "")[:64]))
+    except Exception:
+        log.exception("could not note usage")
+
+
+def flush_usage():
+    with _usage_lock:
+        rows = _usage_buf[:]
+        del _usage_buf[:]
+    if not rows:
+        return
+    try:
+        with pool().connection() as con:
+            con.cursor().executemany("INSERT INTO usage_log(ts,day,service,kind,model,qty,cost_usd,uid) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)", rows)
+    except Exception:
+        log.exception("could not save %d usage rows", len(rows))
+
+
+def usage_kind():
+    """Which feature a billable call belongs to: the name of the route that is running, or 'background'."""
+    return (request.endpoint or "background") if has_request_context() else "background"
+
+
+def usage_uid():
+    return g.user["uid"] if has_request_context() and "user" in g else ""
 
 
 init_db()
@@ -323,9 +406,16 @@ def enrolled_ids(uid):
     return ids
 
 
+def is_owner(u):
+    return bool(u) and u["email"] in OWNER_EMAILS
+
+
 def user_json(u):
-    return {"uid": u["uid"], "email": u["email"], "fullName": u["full_name"], "dob": u["dob"], "gender": u["gender"],
-            "enrolledCourses": enrolled_ids(u["uid"]), "createdAt": u["created_at"]}
+    out = {"uid": u["uid"], "email": u["email"], "fullName": u["full_name"], "dob": u["dob"], "gender": u["gender"],
+           "enrolledCourses": enrolled_ids(u["uid"]), "createdAt": u["created_at"]}
+    if is_owner(u):
+        out["isOwner"] = True   # only ever present for an owner account; every owner route also checks on the server
+    return out
 
 
 def course_json(r):
@@ -345,7 +435,7 @@ def lesson_json(cid, i, title):
 def json_only_posts():
     # Cross-site forms can't send application/json without a CORS preflight, which blocks CSRF.
     # The webhook and the weekly-report trigger are called by other servers and are protected by their own secrets.
-    if request.method == "POST" and request.endpoint not in ("flutterwave_webhook", "weekly_reports_run", "voice_transcribe") and not request.is_json:
+    if request.method == "POST" and request.endpoint not in ("flutterwave_webhook", "stripe_webhook", "weekly_reports_run", "voice_transcribe") and not request.is_json:
         return err("Content-Type must be application/json.", 415)
 
 
@@ -381,6 +471,7 @@ def send_resend(to, subject, text, html):
     if not r.ok:
         log.error("Resend rejected the email (HTTP %s): %s", r.status_code, r.text[:300])
         r.raise_for_status()
+    log_usage("resend", control.email_kind(subject))
 
 
 def send_code_email(email, code):
@@ -600,7 +691,7 @@ def courses():
                               WHERE c.owner_uid=? AND p.status='pending'""", (uid,)).fetchone()["c"]
     return jsonify(courses=out, group=group_summary(grp) if grp else None, pending=pending,
                    canCreate=not GROUP_CREATORS or g.user["email"] in GROUP_CREATORS,
-                   demo={"available": DEMO_UNLOCK, "on": demo_pro_on(uid)})
+                   demo={"available": DEMO_UNLOCK, "on": demo_pro_on(uid)}, payment=price_info())
 
 
 @app.get("/api/courses/<cid>")
@@ -634,7 +725,133 @@ def demo_pro():
     session["demo_pro"] = on
     return jsonify(ok=True, demo={"available": True, "on": on}, user=user_json(g.user))
 
-# ───────────────────────── Flutterwave payments ─────────────────────────
+# ───────────────────────── Payments: Stripe (Flutterwave kept only as a fallback until Stripe is switched on) ─────────────────────────
+
+
+def payment_provider():
+    """'stripe' as soon as a Stripe key is set; otherwise 'flutterwave' while its keys exist; otherwise None."""
+    if STRIPE_KEY and STRIPE_MINOR:
+        return "stripe"
+    return "flutterwave" if FLW_PUBLIC else None
+
+
+def price_info():
+    """What one track costs and who takes the payment. The browser only displays this; the server decides the price."""
+    p = payment_provider()
+    if p == "stripe":
+        return {"provider": p, "currency": STRIPE_CURRENCY.upper(), "amount": STRIPE_MINOR // 100 if STRIPE_MINOR % 100 == 0 else STRIPE_MINOR / 100,
+                "text": billing.money_text(STRIPE_MINOR, STRIPE_CURRENCY)}
+    return {"provider": p, "currency": CURRENCY, "amount": PRICE_NGN, "text": billing.money_text(PRICE_NGN * 100, "ngn")}
+
+
+def checkout_base():
+    """The site's own address, using https when the app sits behind Render's proxy."""
+    env = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
+    if env:
+        return env
+    proto = (request.headers.get("X-Forwarded-Proto", "") or request.scheme).split(",")[0].strip() or "https"
+    return f"{proto}://{request.host}"
+
+
+def audit(actor, action, detail):
+    db().execute("INSERT INTO owner_audit(ts,actor,action,detail) VALUES(?,?,?,?)", (now_iso(), actor, action, str(detail)[:500]))
+
+
+def notify_owner(subject, text):
+    """Email every owner address in the background, so an email can never hold up a request."""
+    if not OWNER_EMAILS:
+        return
+    html = omega._wrap(APP_NAME, "".join(f"<p>{omega._e(p)}</p>" for p in text.split("\n\n")))
+
+    def run():
+        for to in sorted(OWNER_EMAILS):
+            try:
+                send_plain_email(to, subject, text, html)
+            except Exception:
+                log.exception("owner notice failed")
+    threading.Thread(target=run, daemon=True).start()
+
+
+def stripe_call(method, path, data=None, idem=None):
+    """One call to Stripe's API. Returns (http status, json body). Raises requests.RequestException if Stripe cannot be reached."""
+    headers = {"Stripe-Version": billing.API_VERSION}
+    if idem:
+        headers["Idempotency-Key"] = idem
+    r = requests.request(method, billing.API + path, data=data, auth=(STRIPE_KEY, ""), headers=headers, timeout=20)
+    try:
+        body = r.json() if r.content else {}
+    except ValueError:
+        body = {}
+    return r.status_code, body if isinstance(body, dict) else {}
+
+
+def note_stripe_error(body, status):
+    """Keep the last checkout problem where the Control Room can show it, in Stripe's own words."""
+    msg = ((body or {}).get("error") or {}).get("message") or f"HTTP {status}"
+    log.error("stripe checkout failed: %s", msg)
+    try:
+        db().execute("INSERT INTO owner_meta(key,value) VALUES('stripe_error',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (f"{now_iso()} {msg}"[:400],))
+        db().commit()
+    except Exception:
+        log.exception("could not keep the stripe error")
+        db().rollback()
+
+
+def stripe_apply(s):
+    """Act on a Stripe Checkout Session: unlock the track only when it is really paid. Safe to repeat.
+    Returns (state, why): 'paid', 'pending', 'failed', 'mismatch', 'closed' (already refunded or disputed) or 'unknown'."""
+    con = db()
+    ref = (s.get("client_reference_id") or (s.get("metadata") or {}).get("tx_ref")) if isinstance(s, dict) else None
+    pay = con.execute("SELECT * FROM payments WHERE tx_ref=? AND provider='stripe'", (ref,)).fetchone() if isinstance(ref, str) else None
+    if pay is None:
+        return "unknown", "unknown payment reference"
+    if pay["status"] in ("refunded", "disputed"):
+        return "closed", pay["status"]
+    state, why = billing.judge_session(s, pay)
+    if state == "paid":
+        pi = s.get("payment_intent")
+        pi = pi.get("id") if isinstance(pi, dict) else pi
+        with con.transaction():   # atomic: both writes happen or neither does
+            con.execute("UPDATE payments SET status='verified', stripe_session_id=COALESCE(stripe_session_id, ?), stripe_payment_intent=?, verified_at=? "
+                        "WHERE tx_ref=? AND status IN ('pending','failed')", (s.get("id"), pi if isinstance(pi, str) else None, now_iso(), pay["tx_ref"]))
+            con.execute("INSERT INTO enrollments(uid,course_id,created_at) VALUES(?,?,?) ON CONFLICT DO NOTHING", (pay["uid"], pay["course_id"], now_iso()))
+        con.commit()
+    elif state == "failed":
+        con.execute("UPDATE payments SET status='failed' WHERE tx_ref=? AND status='pending'", (pay["tx_ref"],))
+        con.commit()
+    elif state == "mismatch":
+        log.warning("stripe session rejected tx_ref=%s: %s", pay["tx_ref"], why)
+    return state, why
+
+
+def stripe_refunded(charge):
+    """A fully refunded charge closes the payment and takes the track back. A partial refund changes nothing."""
+    pi = charge.get("payment_intent")
+    if not isinstance(pi, str) or charge.get("refunded") is not True:
+        return
+    con = db()
+    pay = con.execute("SELECT * FROM payments WHERE stripe_payment_intent=? AND provider='stripe'", (pi,)).fetchone()
+    if pay is None or pay["status"] != "verified":
+        return
+    with con.transaction():
+        con.execute("UPDATE payments SET status='refunded' WHERE tx_ref=?", (pay["tx_ref"],))
+        con.execute("DELETE FROM enrollments WHERE uid=? AND course_id=?", (pay["uid"], pay["course_id"]))
+        audit("stripe", "refund", f"{pay['tx_ref']} {pay['course_id']}")
+    con.commit()
+
+
+def stripe_disputed(dispute):
+    """A customer disputed a payment with their bank: flag it and tell the owner. Access stays until the dispute is decided."""
+    pi = dispute.get("payment_intent")
+    con = db()
+    pay = con.execute("SELECT * FROM payments WHERE stripe_payment_intent=? AND provider='stripe'", (pi,)).fetchone() if isinstance(pi, str) else None
+    if pay is None:
+        return
+    if pay["status"] == "verified":
+        con.execute("UPDATE payments SET status='disputed' WHERE tx_ref=?", (pay["tx_ref"],))
+    audit("stripe", "dispute", f"{pay['tx_ref']} {pay['course_id']}")
+    con.commit()
+    notify_owner("A payment was disputed", f"A student disputed a payment with their bank ({pay['course_id']}, reference {pay['tx_ref']}).\n\nOpen the Stripe Dashboard, then Payments, then Disputes, to answer it before the deadline.")
 
 
 def flw_verify(transaction_id):
@@ -646,7 +863,7 @@ def flw_verify(transaction_id):
 def fulfil(tx_ref, transaction_id):
     """Verify with Flutterwave, then enroll. Idempotent. Returns (ok, message, http_status)."""
     con = db()
-    pay = con.execute("SELECT * FROM payments WHERE tx_ref=?", (tx_ref,)).fetchone()
+    pay = con.execute("SELECT * FROM payments WHERE tx_ref=? AND provider='flutterwave'", (tx_ref,)).fetchone()   # a row is only ever verified by its own provider
     if pay is None:
         return False, "Unknown payment reference.", 404
     if pay["status"] == "verified":
@@ -695,21 +912,75 @@ def payment_init():
     gate = purchase_access(g.user["uid"], cid)
     if gate["state"] != "open":
         return err(GATE_MESSAGES.get(gate["state"], "You cannot buy this class right now."), 403)
-    if not FLW_PUBLIC:
+    provider, uid = payment_provider(), g.user["uid"]
+    if provider is None:
         return err("Payments are not configured yet.", 503)
+    since = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
+    if db().execute("SELECT COUNT(*) AS n FROM payments WHERE uid=? AND created_at>?", (uid, since)).fetchone()["n"] >= 10:
+        return err("Too many payment attempts in a short time. Please wait a little and try again.", 429)
     tx_ref = f"OATS-{uuid.uuid4().hex}"   # unique per attempt
-    db().execute("INSERT INTO payments(tx_ref,uid,course_id,amount,currency,created_at) VALUES(?,?,?,?,?,?)",
-                 (tx_ref, g.user["uid"], cid, PRICE_NGN, CURRENCY, now_iso()))
+    if provider == "flutterwave":   # the old path, used only until Stripe keys are added
+        db().execute("INSERT INTO payments(tx_ref,uid,course_id,amount,currency,created_at) VALUES(?,?,?,?,?,?)",
+                     (tx_ref, uid, cid, PRICE_NGN, CURRENCY, now_iso()))
+        db().commit()
+        return jsonify(provider="flutterwave", txRef=tx_ref, amount=PRICE_NGN, currency=CURRENCY, publicKey=FLW_PUBLIC,
+                       email=g.user["email"], courseId=cid)
+    title = db().execute("SELECT title FROM courses WHERE id=?", (cid,)).fetchone()["title"]
+    db().execute("INSERT INTO payments(tx_ref,uid,course_id,amount,currency,provider,amount_minor,created_at) VALUES(?,?,?,?,?,'stripe',?,?)",
+                 (tx_ref, uid, cid, math.ceil(STRIPE_MINOR / 100), STRIPE_CURRENCY.upper(), STRIPE_MINOR, now_iso()))
     db().commit()
-    return jsonify(txRef=tx_ref, amount=PRICE_NGN, currency=CURRENCY, publicKey=FLW_PUBLIC,
-                   email=g.user["email"], courseId=cid)
+    base = checkout_base()
+    form = billing.checkout_form(tx_ref=tx_ref, uid=uid, course_id=cid, course_title=title, email=g.user["email"], currency=STRIPE_CURRENCY,
+                                 amount_minor=STRIPE_MINOR, success_url=f"{base}/?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
+                                 cancel_url=f"{base}/?checkout=cancel")
+    release_db()   # never hold a database connection while waiting on Stripe
+
+    def give_up(message, status=502):
+        db().execute("UPDATE payments SET status='failed' WHERE tx_ref=? AND status='pending'", (tx_ref,))
+        db().commit()
+        return err(message, status)
+    try:
+        status, body = stripe_call("POST", "/checkout/sessions", data=form, idem=tx_ref)
+    except requests.RequestException:
+        log.exception("stripe could not be reached")
+        return give_up("Could not reach the payment provider. Try again in a moment.")
+    if status != 200 or not str(body.get("id", "")).startswith("cs_") or not str(body.get("url", "")).startswith("https://"):
+        note_stripe_error(body, status)
+        return give_up("Checkout could not be opened. Please try again in a moment.")
+    db().execute("UPDATE payments SET stripe_session_id=? WHERE tx_ref=?", (body["id"], tx_ref))
+    db().commit()
+    return jsonify(provider="stripe", url=body["url"], txRef=tx_ref, courseId=cid)
 
 
 @app.post("/api/payments/verify")
 @login_required
 def payment_verify():
     body = request.get_json(silent=True) or {}
-    tx_ref, tid = body.get("txRef"), body.get("transactionId")
+    if "sessionId" in body:   # Stripe: the student came back from the checkout page
+        sid = body.get("sessionId")
+        if not isinstance(sid, str) or not re.fullmatch(r"cs_[A-Za-z0-9_]{8,200}", sid):
+            return err("sessionId is required.")
+        pay = db().execute("SELECT * FROM payments WHERE stripe_session_id=? AND provider='stripe'", (sid,)).fetchone()
+        if pay is None or pay["uid"] != g.user["uid"]:
+            return err("Unknown payment reference.", 404)
+        if pay["status"] in ("refunded", "disputed"):
+            return err("This payment was refunded or disputed.", 409)
+        if pay["status"] != "verified":
+            release_db()
+            try:
+                status, s = stripe_call("GET", f"/checkout/sessions/{sid}")
+            except requests.RequestException:
+                log.exception("stripe verify failed")
+                return err("Could not reach the payment provider. Try again in a moment.", 502)
+            if status != 200:
+                return err("Payment could not be verified.", 402)
+            state, why = stripe_apply(s)
+            if state == "pending":
+                return jsonify(pending=True, message="Your payment is still being confirmed."), 202
+            if state != "paid":
+                return err("This payment did not go through." if state == "failed" else "Payment could not be verified.", 402)
+        return jsonify(ok=True, courseId=pay["course_id"], user=user_json(g.user))
+    tx_ref, tid = body.get("txRef"), body.get("transactionId")   # Flutterwave (fallback)
     if not isinstance(tx_ref, str) or not re.fullmatch(r"\d{1,20}", str(tid or "")):
         return err("txRef and transactionId are required.")
     pay = db().execute("SELECT uid FROM payments WHERE tx_ref=?", (tx_ref,)).fetchone()
@@ -719,6 +990,42 @@ def payment_verify():
     if not ok:
         return err(msg, status)
     return jsonify(ok=True, user=user_json(g.user))
+
+
+@app.post("/api/stripe/webhook")
+def stripe_webhook():
+    """Stripe reports payments here, signed with STRIPE_WEBHOOK_SECRET. This is what unlocks a bank transfer that clears after the
+    student has already left the page, and what closes a payment that gets refunded."""
+    raw = request.get_data()
+    if not billing.verify_signature(STRIPE_WHSEC, request.headers.get("Stripe-Signature", ""), raw):
+        return "", 400
+    try:
+        ev = json.loads(raw)
+    except ValueError:
+        return "", 400
+    if not isinstance(ev, dict):
+        return "", 400
+    etype, obj = str(ev.get("type", "")), (ev.get("data") or {}).get("object")
+    obj = obj if isinstance(obj, dict) else {}
+    try:
+        db().execute("INSERT INTO stripe_events(id,type,received_at) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET received_at=excluded.received_at",
+                     (str(ev.get("id", ""))[:80], etype[:80], now_iso()))
+        db().commit()
+        if etype in ("checkout.session.completed", "checkout.session.async_payment_succeeded", "checkout.session.expired"):
+            state, why = stripe_apply(obj)
+            log.info("stripe %s -> %s %s", etype, state, why)
+        elif etype == "checkout.session.async_payment_failed":
+            db().execute("UPDATE payments SET status='failed' WHERE tx_ref=? AND provider='stripe' AND status='pending'", (str(obj.get("client_reference_id")),))
+            db().commit()
+        elif etype == "charge.refunded":
+            stripe_refunded(obj)
+        elif etype == "charge.dispute.created":
+            stripe_disputed(obj)
+    except Exception:
+        log.exception("stripe webhook failed: %s", etype)
+        db().rollback()
+        return "", 500   # Stripe will try again
+    return "", 200
 
 
 @app.post("/api/flutterwave/webhook")
@@ -1040,7 +1347,9 @@ def run_image_job(row_id, prompt, size):
         if r.status_code == 400 and (r.json().get("error") or {}).get("code") in ("moderation_blocked", "content_policy_violation"):
             msg = "The image service would not make that picture. Try describing something different. It did not use up one of your turns."
         elif r.ok:
-            item = r.json()["data"][0]
+            reply = r.json()
+            item = reply["data"][0]
+            log_usage("openai", "lesson_image_make", IMAGE_MODEL, 1, control.image_cost(IMAGE_MODEL, IMAGE_QUALITY, size, reply.get("usage")))
             data = base64.b64decode(item["b64_json"]) if item.get("b64_json") else requests.get(item["url"], timeout=60).content
             if len(data) < 1000:
                 data = None
@@ -1058,6 +1367,7 @@ def run_image_job(row_id, prompt, size):
     except Exception:
         log.exception("could not save the picture result")   # the stale-picture cleanup hands the turn back
     finally:
+        flush_usage()   # this thread has no request to do it when it ends
         _image_slots.release()
 
 
@@ -1201,7 +1511,14 @@ def openai_chat(messages, *, smart=False, json_mode=False, temperature=0.4, max_
                       json=chat_body(model, messages, json_mode=json_mode, temperature=temperature, max_tokens=max_tokens, tools=tools, effort=effort),
                       timeout=timeout * (2 if is_reasoning_model(model) else 1))
     r.raise_for_status()
-    msg = r.json()["choices"][0]["message"]
+    reply = r.json()
+    msg = reply["choices"][0]["message"]
+    try:   # note what this call cost, for the owner's meter
+        u = reply.get("usage") or {}
+        log_usage("openai", usage_kind(), model, (u.get("prompt_tokens") or 0) + (u.get("completion_tokens") or 0),
+                  control.chat_cost(model, u.get("prompt_tokens"), u.get("completion_tokens"), (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0)), usage_uid())
+    except Exception:
+        log.exception("could not note chat usage")
     return msg if raw else (msg.get("content") or "")
 
 
@@ -1841,6 +2158,7 @@ def voice_speak():
     except Exception:
         log.exception("speech failed")
         return err("Air Omega's voice is resting. Please try again.", 502)
+    log_usage("openai", "voice_speak", TTS_MODEL, len(text), control.tts_cost(TTS_MODEL, len(text)), uid)
     usage_add(uid, "speak")
     return Response(r.content, mimetype="audio/mpeg", headers={"Cache-Control": "no-store"})
 
@@ -1873,7 +2191,9 @@ def voice_transcribe():
         if not r.ok:
             log.error("transcription API %s: %s", r.status_code, r.text[:300])
         r.raise_for_status()
-        text = " ".join(str(r.json().get("text", "")).split())
+        heard = r.json()
+        text = " ".join(str(heard.get("text", "")).split())
+        log_usage("openai", "voice_transcribe", STT_MODEL, len(data), control.stt_cost(STT_MODEL, heard.get("usage"), len(data)), uid)
     except Exception:
         log.exception("transcription failed")
         return err("Could not understand that recording. Please try again.", 502)
@@ -1895,7 +2215,7 @@ def app_guide():
     n_les = max((r["lessons_count"] for r in rows), default=8)
     names = {r["id"]: r["title"] for r in rows}
     free_note = " ".join(f"The first {n} lessons of {names.get(c, c)} are free to read for any signed-in student, and the rest of that track needs unlocking." for c, n in FREE_LESSONS.items())
-    return f"""ABOUT: Open Air Tech Space is a learning app of hands-on tech tracks for beginners, mostly teenagers in Nigeria. There are {len(rows)} tracks. Each track costs a flat NGN {PRICE_NGN:,}, paid once with Flutterwave (card, bank transfer or USSD). The server checks the payment and the track unlocks at once, for life. The price is fixed and cannot be negotiated. {free_note}
+    return f"""ABOUT: Open Air Tech Space is a learning app of hands-on tech tracks for beginners, mostly teenagers in Nigeria. There are {len(rows)} tracks. Each track costs a flat {price_info()['text']}, paid once on a secure checkout page (card, and other methods where the checkout offers them). The server checks the payment and the track unlocks at once, for life. The price is fixed and cannot be negotiated. {free_note}
 TRACKS (use these ids in actions):
 {tracks}
 ACCOUNT: sign up with full name, email, date of birth (age 5 or older), gender and a password of 8 to 128 characters with letters and at least one number, then confirm with a 6-digit code emailed to you. Sign in with email and password. If the password is forgotten, use the forgot-password link on the sign-in page to get a code by email.
@@ -2493,6 +2813,441 @@ def admin_remove(token, uid):
 @app.get("/admin/<token>")
 def index(**_):
     return send_from_directory("static", "index.html")
+
+
+# ───────────────────────── Live users and the owner's Control Room ─────────────────────────
+# Everything in this section is for the owner only, except /api/ping, which is the small heartbeat every open tab sends so the
+# owner can see how many students are online. The owner routes answer 404 to everyone whose email is not in OWNER_EMAILS.
+LIVE_WINDOW = 75          # seconds: someone counts as online if their tab pinged within this long (the app pings every 30)
+PING_GAP = 10             # seconds: pings from one tab closer together than this are ignored
+GUEST_CAP = 300           # most visitors who are not signed in that are tracked at once, so a flood of fake visitors stays small
+HOUSEKEEP_ASYNC = True    # the tests switch this off so the housekeeping runs inside the request
+PID_RX = re.compile(r"^[A-Za-z0-9_-]{8,40}$")
+_ping_seen, _who_cache, _day_seen, _last_try = {}, {}, set(), [0]
+_ping_lock = threading.Lock()
+
+
+def owner_required(fn):
+    """Only an owner gets in. Everyone else, signed in or not, gets the same 404 a page that does not exist gets."""
+    @wraps(fn)
+    def wrapper(*a, **kw):
+        u = current_user()
+        if not is_owner(u):
+            return err("Not found.", 404)
+        g.user = u
+        return fn(*a, **kw)
+    return wrapper
+
+
+def owner_settings():
+    rows = db().execute("SELECT key, value FROM owner_settings").fetchall()
+    return control.settings_from({r["key"]: r["value"] for r in rows})
+
+
+def claim(key, now, every):
+    """True for exactly one caller in each `every` seconds, across all server workers. The database decides who wins."""
+    row = db().execute("INSERT INTO owner_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value "
+                       "WHERE owner_meta.value::bigint < ? RETURNING key", (key, str(now), now - every)).fetchone()
+    db().commit()
+    return row is not None
+
+
+def _who(uid):
+    """(shown name, is an owner) for a signed-in student, remembered for ten minutes so a heartbeat rarely needs the database."""
+    now = time.time()
+    hit = _who_cache.get(uid)
+    if hit and now - hit[2] < 600:
+        return hit[0], hit[1]
+    u = db().execute("SELECT email, full_name FROM users WHERE uid=?", (uid,)).fetchone()
+    val = (shown_name(u), u["email"] in OWNER_EMAILS) if u else (None, False)
+    if len(_who_cache) > 5000:
+        _who_cache.clear()
+    _who_cache[uid] = (val[0], val[1], now)
+    return val
+
+
+def live_snapshot(now):
+    """(signed-in students online keyed by uid with their newest tab, number of visitors who are not signed in)."""
+    rows = db().execute("SELECT pid, uid, name, place, seen_at FROM presence WHERE seen_at>=? ORDER BY seen_at DESC", (now - LIVE_WINDOW,)).fetchall()
+    users, guests = {}, 0
+    for r in rows:
+        if r["uid"]:
+            users.setdefault(r["uid"], r)   # one student with three tabs open is one student
+        else:
+            guests += 1
+    return users, guests
+
+
+@app.post("/api/ping")
+def ping():
+    d = request.get_json(silent=True) or {}
+    pid = d.get("pid")
+    if not isinstance(pid, str) or not PID_RX.match(pid):
+        return err("Bad request.", 400)
+    now = int(time.time())
+    place = re.sub(r"[^A-Za-z0-9 /&+.-]", "", str(d.get("place") or ""))[:40].strip()
+    uid = session.get("uid")
+    name, owner = _who(uid) if uid else (None, False)
+    signed = bool(uid and name)
+    with _ping_lock:   # a limit for each tab, not each network address: many students share one phone-network address
+        fresh = now - _ping_seen.get(pid, 0) >= PING_GAP
+        if fresh:
+            _ping_seen[pid] = now
+            if len(_ping_seen) > 5000:
+                for k in [k for k, v in _ping_seen.items() if v < now - 300]:
+                    del _ping_seen[k]
+                if len(_ping_seen) > 20000:
+                    _ping_seen.clear()
+    counted = fresh and not (owner and not owner_settings()["count_owner"])
+    if counted:
+        con = db()
+        con.execute("""INSERT INTO presence(pid,uid,name,place,seen_at)
+                       SELECT ?,?,?,?,?::bigint
+                       WHERE ?::boolean OR EXISTS(SELECT 1 FROM presence WHERE pid=?)
+                          OR (SELECT COUNT(*) FROM presence WHERE uid IS NULL AND seen_at>=?::bigint) < ?
+                       ON CONFLICT(pid) DO UPDATE SET uid=excluded.uid, name=excluded.name, place=excluded.place, seen_at=excluded.seen_at""",
+                    (pid, uid if signed else None, name or "", place, now, signed, pid, now - LIVE_WINDOW, GUEST_CAP))
+        day = omega.lagos_date()
+        if signed and not owner and (day, uid) not in _day_seen:
+            if len(_day_seen) > 20000:
+                _day_seen.clear()
+            con.execute("INSERT INTO active_days(day,uid) VALUES(?,?) ON CONFLICT DO NOTHING", (day, uid))
+            _day_seen.add((day, uid))
+        con.commit()
+    if fresh and now - _last_try[0] >= 20:
+        _last_try[0] = now
+        if HOUSEKEEP_ASYNC:
+            threading.Thread(target=housekeep, daemon=True).start()
+        else:
+            housekeep()
+    out = {"ok": True}
+    if owner:
+        users, guests = live_snapshot(now)
+        out["live"] = len(users) + guests
+    return jsonify(out)
+
+
+def housekeep():
+    """Runs in the background after a ping, at most once a minute across all workers: take a headcount sample, sweep old rows, check for trouble."""
+    try:
+        with app.app_context():
+            now = int(time.time())
+            if not claim("tick", now, 60):
+                return
+            users, guests = live_snapshot(now)
+            con = db()
+            con.execute("INSERT INTO live_samples(ts,n) VALUES(?,?) ON CONFLICT(ts) DO UPDATE SET n=GREATEST(live_samples.n, excluded.n)",
+                        (now // 60 * 60, len(users) + guests))
+            con.execute("DELETE FROM presence WHERE seen_at<?", (now - 3600,))
+            con.commit()
+            if claim("sweep", now, 6 * 3600):
+                old = lambda days: (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+                con.execute("DELETE FROM live_samples WHERE ts<?", (now - 35 * 86400,))
+                con.execute("DELETE FROM usage_log WHERE ts<?", (old(100),))
+                con.execute("DELETE FROM stripe_events WHERE received_at<?", (old(60),))
+                con.commit()
+            if claim("alerts", now, 900):
+                check_alerts()
+    except Exception:
+        log.exception("housekeeping failed")
+
+
+# ── What the meters read ──
+def _since(days):
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+
+
+def db_sizes():
+    """Bytes: the whole database, what grows with students (their progress, chats, scores...), and what does not (the rest, lesson pictures)."""
+    con = db()
+    total = con.execute("SELECT pg_database_size(current_database()) AS b").fetchone()["b"]
+    sizes = {r["t"]: r["b"] for r in con.execute(
+        "SELECT c.relname AS t, pg_total_relation_size(c.oid) AS b FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "WHERE n.nspname='public' AND c.relkind='r'")}
+    images = sizes.get("lesson_images", 0)
+    fixed = images + sizes.get("image_blocks", 0) + sizes.get("courses", 0)
+    student = max(0, sum(sizes.values()) - fixed)
+    return {"total": total, "student": student, "base": max(0, total - student), "images": images}
+
+
+def per_from_db():
+    """What one active student costs a month: measured from the last 30 days when there are enough of them, assumed otherwise."""
+    con, now = db(), int(time.time())
+    users = con.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+    active = con.execute("SELECT COUNT(DISTINCT uid) AS n FROM active_days WHERE day>=?", (omega.lagos_date(datetime.now(timezone.utc) - timedelta(days=29)),)).fetchone()["n"]
+    o30 = con.execute("SELECT COALESCE(SUM(cost_usd),0) AS v FROM usage_log WHERE service='openai' AND ts>=?", (_since(30),)).fetchone()["v"]
+    e30 = con.execute("SELECT COUNT(*) AS n FROM usage_log WHERE service='resend' AND ts>=?", (_since(30),)).fetchone()["n"]
+    peak7 = con.execute("SELECT COALESCE(MAX(n),0) AS v FROM live_samples WHERE ts>=?", (now - 7 * 86400,)).fetchone()["v"]
+    sz = db_sizes()
+    return control.per_student(active, users, o30, e30, sz["student"] / 1048576, sz["base"] / 1048576, peak7)
+
+
+def lagos_day_epoch():
+    return int(datetime.fromisoformat(omega.day_start()).timestamp())
+
+
+def live_payload(now=None):
+    now = now or int(time.time())
+    con = db()
+    users, guests = live_snapshot(now)
+    people = [{"name": r["name"], "place": r["place"], "ago": max(0, now - r["seen_at"])} for r in users.values()][:60]
+    start = now - 86400
+    got = {r["b"]: r["n"] for r in con.execute("SELECT (ts/600)*600 AS b, MAX(n) AS n FROM live_samples WHERE ts>=? GROUP BY b", (start,))}
+    first = start // 600 * 600
+    series = [int(got.get(first + 600 * i, 0)) for i in range(145)]
+    series[-1] = max(series[-1], len(users) + guests)
+    peak = con.execute("SELECT COALESCE(MAX(n),0) AS v FROM live_samples WHERE ts>=?", (lagos_day_epoch(),)).fetchone()["v"]
+    return {"now": len(users) + guests, "signedIn": len(users), "visitors": guests, "people": people, "series": series,
+            "peakToday": max(int(peak), len(users) + guests), "ownerCounted": bool(owner_settings()["count_owner"])}
+
+
+def collect_meters(s):
+    """Everything the Control Room shows, as (page data, the smaller dict control.evaluate reads)."""
+    con, w, now = db(), control.month_window(), int(time.time())
+    a, b = w["start"], w["end"]
+
+    # OpenAI, from the usage log
+    feats = {}
+    for r in con.execute("SELECT kind, COUNT(*) AS calls, COALESCE(SUM(cost_usd),0) AS usd FROM usage_log WHERE service='openai' AND ts>=? AND ts<? GROUP BY kind", (a, b)):
+        f = feats.setdefault(control.feature_label(r["kind"]), {"name": control.feature_label(r["kind"]), "calls": 0, "usd": 0.0})
+        f["calls"] += r["calls"]
+        f["usd"] += r["usd"]
+    features = sorted(({"name": f["name"], "calls": f["calls"], "usd": round(f["usd"], 4)} for f in feats.values()), key=lambda f: -f["usd"])
+    o_mtd = sum(f["usd"] for f in features)
+    o_days = [{"day": r["day"], "usd": round(r["usd"], 4)} for r in con.execute(
+        "SELECT day, COALESCE(SUM(cost_usd),0) AS usd FROM usage_log WHERE service='openai' AND ts>=? AND ts<? GROUP BY day ORDER BY day", (a, b))]
+    o_today = next((d["usd"] for d in o_days if d["day"] == w["today"]), 0.0)
+    o_proj = control.project(o_mtd, w["elapsed"], w["days"])
+    heavy = []
+    for r in con.execute("""SELECT x.uid, COALESCE(SUM(x.cost_usd),0) AS usd, COUNT(*) AS calls, MAX(u.email) AS email, MAX(u.full_name) AS full_name
+                            FROM usage_log x LEFT JOIN users u ON u.uid=x.uid
+                            WHERE x.service='openai' AND x.uid<>'' AND x.ts>=? AND x.ts<? GROUP BY x.uid ORDER BY usd DESC LIMIT 5""", (a, b)):
+        heavy.append({"name": shown_name({"full_name": r["full_name"] or "", "email": r["email"] or "student@"}), "calls": r["calls"], "usd": round(r["usd"], 4)})
+    openai = {"on": bool(os.getenv("OPENAI_API_KEY")), "mtd": round(o_mtd, 4), "today": round(o_today, 4), "projected": round(o_proj, 2),
+              "budget": s["openai_budget_usd"], "features": features, "days": o_days, "heavy": heavy}
+
+    # Resend, from the same log
+    r_month = con.execute("SELECT COUNT(*) AS n FROM usage_log WHERE service='resend' AND ts>=? AND ts<?", (a, b)).fetchone()["n"]
+    r_day = con.execute("SELECT COUNT(*) AS n FROM usage_log WHERE service='resend' AND ts>=?", (_since(1),)).fetchone()["n"]
+    kinds = [{"name": r["kind"], "n": r["n"]} for r in con.execute(
+        "SELECT kind, COUNT(*) AS n FROM usage_log WHERE service='resend' AND ts>=? AND ts<? GROUP BY kind ORDER BY n DESC", (a, b))]
+    resend = {"on": resend_ready(), "month": r_month, "day": r_day, "monthLimit": s["resend_month_limit"], "dayLimit": s["resend_day_limit"], "kinds": kinds}
+
+    # Supabase
+    sz = db_sizes()
+    images_n = con.execute("SELECT COUNT(*) AS n FROM lesson_images WHERE status='ready'").fetchone()["n"]
+    supabase = {"dbBytes": sz["total"], "imagesBytes": sz["images"], "imagesN": images_n, "studentBytes": sz["student"], "limitMb": s["supabase_db_mb"]}
+
+    # Students
+    users_n = con.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+    day0 = omega.day_start()
+    signups = {k: con.execute("SELECT COUNT(*) AS n FROM users WHERE created_at>=?", (since,)).fetchone()["n"]
+               for k, since in (("today", day0), ("week", _since(7)), ("month", _since(30)))}
+    today = omega.lagos_date()
+    dagos = lambda n: omega.lagos_date(datetime.now(timezone.utc) - timedelta(days=n))
+    dau = con.execute("SELECT COUNT(*) AS n FROM active_days WHERE day=?", (today,)).fetchone()["n"]
+    wau = con.execute("SELECT COUNT(DISTINCT uid) AS n FROM active_days WHERE day>=?", (dagos(6),)).fetchone()["n"]
+    mau = con.execute("SELECT COUNT(DISTINCT uid) AS n FROM active_days WHERE day>=?", (dagos(29),)).fetchone()["n"]
+    since_day = (con.execute("SELECT MIN(day) AS d FROM active_days").fetchone() or {}).get("d")
+    learners = con.execute("SELECT COUNT(DISTINCT uid) AS n FROM progress").fetchone()["n"]
+    buyers = con.execute("SELECT COUNT(DISTINCT uid) AS n FROM payments WHERE status IN ('verified','disputed')").fetchone()["n"]
+    students = {"total": users_n, "signups": signups, "dau": dau, "wau": wau, "mau": mau, "countingSince": since_day,
+                "funnel": [{"name": "Signed up", "n": users_n}, {"name": "Active in the last 30 days", "n": mau},
+                           {"name": "Finished a lesson", "n": learners}, {"name": "Bought a track", "n": buyers}]}
+
+    # Sales (a refunded payment is not money in; a disputed one still is until the bank decides)
+    usd_ngn = s["usd_ngn"]
+    pays = con.execute("""SELECT p.uid, p.course_id, p.provider, p.currency, p.status, p.verified_at, COALESCE(p.amount_minor, p.amount*100) AS minor,
+                                 u.email, u.full_name, c.title
+                          FROM payments p LEFT JOIN users u ON u.uid=p.uid LEFT JOIN courses c ON c.id=p.course_id
+                          WHERE p.status IN ('verified','disputed','refunded') AND p.verified_at>=? ORDER BY p.verified_at DESC""", (_since(31),)).fetchall()
+
+    def usd_of(p):
+        return control.to_usd(p["minor"], p["currency"], usd_ngn)
+    month_pays = [p for p in pays if a <= (p["verified_at"] or "") < b]
+    money_in = [p for p in month_pays if p["status"] in ("verified", "disputed")]
+    rev_usd = sum(v for v in (usd_of(p) for p in money_in) if v is not None)
+    other = sorted({p["currency"].upper() for p in money_in if usd_of(p) is None})
+    stripe_fees = sum(control.stripe_fee_usd(usd_of(p), s) for p in money_in if p["provider"] == "stripe" and usd_of(p) is not None)
+    by_day = {}
+    for p in pays:
+        if p["status"] in ("verified", "disputed") and usd_of(p) is not None:
+            d = omega.lagos_date(datetime.fromisoformat(p["verified_at"]))
+            e = by_day.setdefault(d, {"day": d, "n": 0, "usd": 0.0})
+            e["n"] += 1
+            e["usd"] += usd_of(p)
+    recent = [{"when": p["verified_at"], "name": shown_name({"full_name": p["full_name"] or "", "email": p["email"] or "student@"}), "course": p["title"] or p["course_id"],
+               "provider": p["provider"], "text": billing.money_text(p["minor"], p["currency"]), "status": p["status"]} for p in pays[:8]]
+    sales = {"count": len(money_in), "revenueUsd": round(rev_usd, 2), "refunds": sum(1 for p in month_pays if p["status"] == "refunded"),
+             "disputes": sum(1 for p in month_pays if p["status"] == "disputed"), "otherCurrencies": other, "stripeFeesUsd": round(stripe_fees, 2),
+             "days": sorted(by_day.values(), key=lambda e: e["day"]), "recent": recent}
+
+    # Server and payments
+    peak7 = con.execute("SELECT COALESCE(MAX(n),0) AS v FROM live_samples WHERE ts>=?", (now - 7 * 86400,)).fetchone()["v"]
+    ev = con.execute("SELECT COUNT(*) AS n, MAX(received_at) AS last FROM stripe_events").fetchone()
+    last_err = con.execute("SELECT value FROM owner_meta WHERE key='stripe_error'").fetchone()
+    stripe_sales = con.execute("SELECT COUNT(*) AS n FROM payments WHERE provider='stripe' AND status='verified'").fetchone()["n"]
+    provider = payment_provider()
+    pay = {"provider": provider, "mode": billing.key_mode(STRIPE_KEY), "webhookSeen": bool(ev["n"]), "lastWebhook": ev["last"],
+           "lastError": last_err["value"] if last_err else "", "stripeSales": stripe_sales, "price": price_info()["text"]}
+
+    # Money, in dollars
+    flat = s["render_usd"] + s["supabase_usd"] + s["resend_usd"]
+    cost_mtd = o_mtd + flat + stripe_fees
+    cost_proj = o_proj + flat + control.project(stripe_fees, w["elapsed"], w["days"])
+    rev_proj = control.project(rev_usd, w["elapsed"], w["days"])
+    money = {"usdNgn": usd_ngn, "flatUsd": round(flat, 2), "costMtd": round(cost_mtd, 2), "costProjected": round(cost_proj, 2),
+             "feesProjected": round(control.project(stripe_fees, w["elapsed"], w["days"]), 2),
+             "revenueMtd": round(rev_usd, 2), "revenueProjected": round(rev_proj, 2), "profitProjected": round(rev_proj - cost_proj, 2),
+             "plans": {"render": s["render_usd"], "supabase": s["supabase_usd"], "resend": s["resend_usd"]}}
+
+    data = {"month": {"label": w["label"], "day": w["dayOfMonth"], "days": w["days"]}, "openai": openai, "resend": resend, "supabase": supabase,
+            "students": students, "sales": sales, "pay": pay, "money": money, "per": per_from_db(), "peak7": int(peak7),
+            "renderLive": s["render_live_capacity"]}
+    seen = {"openai": {"mtd": o_mtd, "projected": o_proj, "on": openai["on"]}, "resend": {"month": r_month, "day": r_day, "on": resend["on"]},
+            "supabase": {"db_bytes": sz["total"], "images_bytes": sz["images"], "images_n": images_n},
+            "render": {"peak_live": int(peak7), "paid_students": buyers},
+            "stripe": {"provider": provider, "mode": pay["mode"], "webhook_seen": pay["webhookSeen"], "stripe_sales": stripe_sales, "production": ENV == "production"},
+            "money": {"cost_projected": cost_proj, "revenue_projected": rev_proj, "day_of_month": w["dayOfMonth"]}}
+    return data, seen
+
+
+def setup_check(pay):
+    """The launch checklist at the top of the Control Room: what is switched on, and what still needs doing."""
+    items = []
+
+    def add(label, state, hint=""):
+        items.append({"label": label, "state": state, "hint": hint})
+    add("Owner account", "ok" if OWNER_EMAILS else "bad", "" if OWNER_EMAILS else "Set OWNER_EMAILS on Render.")
+    add("Running as a live site", "ok" if ENV == "production" else "warn", "" if ENV == "production" else "Set APP_ENV=production on Render.")
+    add("Testing shortcut is off", "ok" if not os.getenv("DEMO_UNLOCK") else "warn", "" if not os.getenv("DEMO_UNLOCK") else "Remove DEMO_UNLOCK from Render. It must never be on for real students.")
+    if pay["provider"] == "stripe":
+        add(f"Stripe key ({pay['mode'] or 'unknown'} mode)", "ok" if pay["mode"] == "live" or ENV != "production" else "bad",
+            "" if pay["mode"] == "live" or ENV != "production" else "This is a test key. Real students cannot pay with it.")
+    elif STRIPE_KEY:
+        add("Stripe key", "bad", "A Stripe key is set but STRIPE_AMOUNT (or STRIPE_CURRENCY) is wrong, so Stripe is off. Set STRIPE_AMOUNT, for example 4000 for NGN.")
+    else:
+        add("Stripe key", "warn", "Not set. Payments still use Flutterwave. Add STRIPE_SECRET_KEY to switch.")
+    add("Stripe webhook secret", "ok" if STRIPE_WHSEC else "warn", "" if STRIPE_WHSEC else "Add STRIPE_WEBHOOK_SECRET (starts with whsec_).")
+    add("Stripe webhook heard from Stripe", "ok" if pay["webhookSeen"] else "warn", "" if pay["webhookSeen"] else "Nothing received yet. In Stripe, add the endpoint and send a test event.")
+    add("OpenAI key", "ok" if os.getenv("OPENAI_API_KEY") else "warn", "" if os.getenv("OPENAI_API_KEY") else "Air Omega, pictures and voice are off.")
+    add("Email sending (Resend)", "ok" if resend_ready() else "bad", "" if resend_ready() else "Set RESEND_API_KEY and RESEND_FROM. Students cannot get sign-in codes without them.")
+    return items
+
+
+def check_alerts():
+    """Email the owner when something needs attention, each problem at most once every 12 hours (warnings: every 2 days)."""
+    s = owner_settings()
+    if not OWNER_EMAILS or not s["alert_emails"]:
+        return
+    _, seen = collect_meters(s)
+    now, fresh = int(time.time()), []
+    for wn in control.evaluate(seen, s):
+        if wn["level"] in ("bad", "warn") and claim("alert:" + wn["key"], now, 12 * 3600 if wn["level"] == "bad" else 48 * 3600):
+            fresh.append(wn)
+    if fresh:
+        worst = "needs action" if any(x["level"] == "bad" for x in fresh) else "needs a look"
+        notify_owner(f"Control Room: your app {worst}", "\n\n".join(f"{x['title']}: {x['detail']}" for x in fresh) + "\n\nOpen the app and tap Control Room for the full picture.")
+
+
+@app.get("/api/owner/live")
+@owner_required
+def owner_live():
+    return jsonify(live_payload())
+
+
+@app.get("/api/owner/overview")
+@owner_required
+def owner_overview():
+    s = owner_settings()
+    data, seen = collect_meters(s)
+    data["warnings"] = control.evaluate(seen, s)
+    data["setup"] = setup_check(data["pay"])
+    data["settings"], data["presets"] = s, control.presets()
+    data["live"] = live_payload()
+    data["audit"] = [{"when": r["ts"], "actor": r["actor"], "action": r["action"], "detail": r["detail"]}
+                     for r in db().execute("SELECT ts, actor, action, detail FROM owner_audit ORDER BY id DESC LIMIT 15")]
+    data["courses"] = [{"id": r["id"], "title": r["title"]} for r in db().execute("SELECT id, title FROM courses ORDER BY title")]
+    data["whatifDefaults"] = {"students": 100, "buyPct": 10}
+    return jsonify(data)
+
+
+def _clamp(v, lo, hi, default):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    return min(hi, max(lo, f)) if math.isfinite(f) else default
+
+
+@app.post("/api/owner/whatif")
+@owner_required
+def owner_whatif():
+    d = request.get_json(silent=True) or {}
+    s = owner_settings()
+    students = int(_clamp(d.get("students"), 0, 1_000_000, 100))
+    buy = _clamp(d.get("buyPct"), 0, 100, 10) / 100
+    info = price_info()
+    price = control.to_usd(STRIPE_MINOR if info["provider"] == "stripe" else PRICE_NGN * 100, STRIPE_CURRENCY if info["provider"] == "stripe" else "ngn", s["usd_ngn"])
+    price = _clamp(d.get("priceUsd"), 0.1, 10000, price if price is not None else 2.7)
+    res = control.whatif(students, per_from_db(), s, price, buy)
+    res["priceUsd"] = round(price, 2)
+    return jsonify(res)
+
+
+@app.post("/api/owner/settings")
+@owner_required
+def owner_save_settings():
+    body = request.get_json(silent=True) or {}
+    good, bad = control.clean_settings(body.get("settings", body))
+    if bad:
+        return err("These need a valid number: " + ", ".join(sorted(bad)) + ".", 400)
+    if not good:
+        return err("Nothing to save.", 400)
+    con = db()
+    with con.transaction():
+        for k, v in good.items():
+            con.execute("INSERT INTO owner_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, str(v)))
+        audit(g.user["email"], "settings", ", ".join(f"{k}={v}" for k, v in good.items()))
+    con.commit()
+    return jsonify(ok=True, settings=owner_settings())
+
+
+@app.post("/api/owner/grant")
+@owner_required
+def owner_grant():
+    d = request.get_json(silent=True) or {}
+    email, cid = norm_email(d.get("email")), d.get("courseId")
+    if not email:
+        return err("Type the student's email address.", 400)
+    con = db()
+    u = con.execute("SELECT uid, email, full_name FROM users WHERE email=?", (email,)).fetchone()
+    if u is None:
+        return err("No student has signed up with that email yet. Ask them to sign up first.", 404)
+    c = con.execute("SELECT id, title FROM courses WHERE id=?", (cid,)).fetchone() if isinstance(cid, str) else None
+    if c is None:
+        return err("Choose a track.", 400)
+    added = con.execute("INSERT INTO enrollments(uid,course_id,created_at) VALUES(?,?,?) ON CONFLICT DO NOTHING", (u["uid"], c["id"], now_iso())).rowcount
+    audit(g.user["email"], "grant", f"{email} {c['id']}" + ("" if added else " (already had it)"))
+    con.commit()
+    return jsonify(ok=True, already=not added, name=shown_name(u), course=c["title"])
+
+
+@app.post("/api/owner/test-alert")
+@owner_required
+def owner_test_alert():
+    if not claim("test_alert", int(time.time()), 30):
+        return err("Wait half a minute before sending another test.", 429)
+    to = g.user["email"]
+    text = "This is a test from your Control Room. If you can read it, alerts reach you.\n\nWhen a bill is about to run out or a limit is close, you will get an email like this."
+    release_db()
+    try:
+        send_plain_email(to, "Control Room: test alert", text, omega._wrap(APP_NAME, "".join(f"<p>{omega._e(p)}</p>" for p in text.split("\n\n"))))
+    except Exception as e:
+        log.exception("test alert failed")
+        return err(f"The email could not be sent: {str(e)[:160]}", 502)
+    return jsonify(ok=True, sent=resend_ready())
+
 
 
 # ───────────────────────── Installable app (PWA) ─────────────────────────
