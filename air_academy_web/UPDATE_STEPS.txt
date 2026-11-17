@@ -1,81 +1,91 @@
-AIR ACADEMY: STRIPE PAYMENTS + LIVE USERS + CONTROL ROOM UPDATE
-===============================================================
+AIR ACADEMY: LIVE USERS + CONTROL ROOM UPDATE (payments stay on FLUTTERWAVE)
+============================================================================
 
 WHAT YOU GET
-- Stripe checkout instead of Flutterwave (Flutterwave keeps working until you add Stripe keys,
-  so no sale is lost while you set Stripe up).
+- Payments stay on Flutterwave. Stripe is switched OFF and stays off unless you add a Stripe key,
+  which you will not do. Do not add any variable that starts with STRIPE_.
 - A green "N live - Control Room" button on YOUR dashboard only. It shows how many people are
   using the app right now (one person = 1, two = 2, and so on), refreshed every few seconds.
 - The Control Room (only your email can open it): live users, an OpenAI/Resend/Supabase/Render
-  cost meter with warnings and email alerts, this month's bill and projection, a "what if I had
-  1,000 students" slider, sales, sign-ups, a launch checklist, and a tool to give a student a track.
+  cost meter with warnings and email alerts, this month's bill with Flutterwave's fees counted,
+  a "what if I had 1,000 students" slider, sales, sign-ups, a launch checklist, and a tool to give
+  a student a track.
+- It warns you (red) if Flutterwave TEST keys are left on your live site. Test keys would let
+  anyone "pay" with Flutterwave's test card and get a track free.
+- OPTIONAL: a dollar price for students outside Nigeria (see STEP 3).
 - Your students' accounts, courses and payments are NOT touched. New tables are added by
   themselves when the app starts.
 
 STEP 1. COPY THE FILES (PowerShell, inside the folder that has app.py)
 
-    Expand-Archive -Path "$HOME\Downloads\air_academy_stripe_control_room.zip" -DestinationPath . -Force
+    Expand-Archive -Path "$HOME\Downloads\air_academy_flutterwave_control_room.zip" -DestinationPath . -Force
 
 This adds billing.py, control.py, static/live.js, static/owner.js and replaces app.py, omega.py,
 README.md and the static files. It does not touch your .env, your database or your lesson files.
+(Use THIS zip, not the earlier Stripe one. It contains everything.)
 
 STEP 2. RENDER SETTINGS (Dashboard > your service > Environment)
-Add this first. It turns on the live counter and Control Room for you only:
 
     OWNER_EMAILS = your-own-gmail-address@gmail.com   (the Gmail you sign in with)
 
-Type your real address here on Render only. It is deliberately not in the code or in this file, because your code is on public GitHub.
-Also check: APP_ENV=production, and DEMO_UNLOCK must NOT exist.
+Type your real address here on Render only. It is deliberately not in the code or in this file,
+because your code is on public GitHub.
 
-Settings > Start Command (so one slow OpenAI answer does not freeze everybody else):
+Your Flutterwave keys (Flutterwave dashboard > Settings > API keys):
 
-    gunicorn app:app --workers 2 --threads 4 --timeout 120
+    FLW_PUBLIC_KEY   = FLWPUBK-...      (LIVE key: no "_TEST" in it)
+    FLW_SECRET_KEY   = FLWSECK-...      (LIVE key: no "_TEST" in it)
+    FLW_WEBHOOK_HASH = any long random password you make up (letters and numbers)
 
-STEP 3. PUSH
+Use the pair from the same mode. A test key and a live key together will not work.
+
+Also check:
+  - APP_ENV=production
+  - DEMO_UNLOCK must NOT exist
+  - If you added any STRIPE_ variable earlier (STRIPE_SECRET_KEY, STRIPE_CURRENCY, STRIPE_AMOUNT,
+    STRIPE_WEBHOOK_SECRET), DELETE them. With no Stripe key the app uses Flutterwave.
+
+Settings > Start Command (so one slow OpenAI answer does not freeze everybody else). Your repository
+has a folder called air_academy_web, so the command is:
+
+    gunicorn --chdir air_academy_web app:app --workers 2 --threads 4 --timeout 120
+
+STEP 3. OPTIONAL: LET STUDENTS OUTSIDE NIGERIA PAY IN DOLLARS
+Add on Render:
+
+    FLW_USD_AMOUNT = 3        (a whole number of dollars; pick your own price)
+
+Then every locked course shows a second button under the naira button:
+"Paying from outside Nigeria? Pay $3 by international card". Dollar payments are card only
+(Flutterwave offers bank transfer and USSD for naira only). Leave FLW_USD_AMOUNT out and the app
+is naira only, exactly as before.
+Before you turn it on, check two things with Flutterwave (dashboard or support chat):
+  1. Your account is allowed to accept payments in US dollars.
+  2. How and when your dollar sales are paid out to you (in dollars or in naira).
+Flutterwave charges more for international cards (often up to about 3.8%). The Control Room
+estimates it and you can correct the rate under Plans. Do one real test purchase with an
+international card before you announce it.
+
+STEP 4. FLUTTERWAVE WEBHOOK (so a payment unlocks even if the student closes the page)
+Flutterwave dashboard > Settings > Webhooks:
+  - URL:         https://YOUR-SITE.onrender.com/api/flutterwave/webhook
+  - Secret hash: exactly the same value you put in FLW_WEBHOOK_HASH on Render
+
+STEP 5. PUSH
 
     git add .
-    git commit -m "Stripe payments, live users and Control Room"
+    git commit -m "Live users, Control Room and optional dollar price"
     git push
 
 Render rebuilds. Sign in with your Gmail: you will see the green Control Room button.
 
-STEP 4. OPEN THE CONTROL ROOM > PLANS
-Tell it what you really pay (Render plan, Supabase plan, Resend plan, how much OpenAI you are
-willing to spend, naira per dollar). Pick a plan from each list or type your own numbers, then Save.
-Until you do, it uses free-plan defaults and the warnings will not match your real bill.
-Then press "Send a test alert" and confirm the email reaches you (check spam).
-
-STEP 5. STRIPE (test mode first)
-READ THIS FIRST: Stripe does not support businesses registered in Nigeria directly. Naira card and
-bank-transfer payments are an invite-only Stripe preview, and only for accounts outside Nigeria
-(paid out in dollars). Check what your Stripe account allows before you rely on it. Stripe also keeps
-a fixed 30 cents per sale, which is a big part of a 4,000 naira sale (about $2.4).
-
-When you are ready:
- 1. Stripe dashboard: switch on Test mode. Copy the secret key (sk_test_...).
- 2. Render > Environment, add:
-        STRIPE_SECRET_KEY = sk_test_...
-        STRIPE_CURRENCY   = ngn          (or usd, or whatever your account supports)
-        STRIPE_AMOUNT     = 4000         (the price in that currency, e.g. 2.99 for USD)
- 3. Stripe > Developers > Webhooks > Add endpoint:
-        URL:    https://YOUR-SITE.onrender.com/api/stripe/webhook
-        Events: checkout.session.completed
-                checkout.session.async_payment_succeeded
-                checkout.session.async_payment_failed
-                checkout.session.expired
-                charge.refunded
-                charge.dispute.created
- 4. Copy the signing secret (whsec_...) to Render:
-        STRIPE_WEBHOOK_SECRET = whsec_...
- 5. Test: sign in with a different email, tap Unlock, pay with card 4242 4242 4242 4242 (any future
-    date, any CVC). The track should unlock when you come back. In the Control Room > Setup check
-    you should see "Stripe webhook heard from Stripe".
- 6. Go live: replace the key with sk_live_... and the webhook secret with the live one.
-    (The Control Room warns you if a test key is left on a live site.)
-
-Which payment methods appear (cards, bank transfer...) is set in Stripe > Settings > Payment
-methods. No code change needed. Refunds are done in the Stripe dashboard: a full refund takes the
-track back automatically.
+STEP 6. OPEN THE CONTROL ROOM > SETUP CHECK, THEN PLANS
+Setup check should show green ticks for "Flutterwave keys (live mode)", the webhook secret hash and
+(after the first real payment) "Flutterwave webhook heard". A red cross means act now; read its note.
+Then open Plans and tell it what you really pay (Render plan, Supabase plan, Resend plan, how much
+OpenAI you are willing to spend, naira per dollar, Flutterwave fee). Pick a plan from each list or
+type your own numbers, then Save. Until you do, it uses free-plan defaults and the warnings will
+not match your real bill. Press "Send a test alert" and confirm the email reaches you (check spam).
 
 HOW THE LIVE COUNT WORKS
 Every open tab pings the server every 30 seconds. Someone counts for 75 seconds after their last
@@ -85,12 +95,20 @@ a visitor. Or tap "Count me too" in the Live section.
 
 ABOUT THE COST NUMBERS
 They are estimates. OpenAI is counted from tokens at the public price list, so compare with
-platform.openai.com now and then. Render, Supabase and Resend use the plans you enter. The
-"what if" slider assumes about 30 cents of AI per active student a month until you have 10 active
-students; after that it uses what your real students actually cost.
+platform.openai.com now and then. Render, Supabase and Resend use the plans you enter. Flutterwave's
+fee is estimated from the rates under Plans (check your own rate in your Flutterwave dashboard).
+The "what if" slider assumes about 30 cents of AI per active student a month until you have 10
+active students; after that it uses what your real students actually cost.
+
+REFUNDS
+Refund in the Flutterwave dashboard. The app does not take the track back automatically on a
+Flutterwave refund, so tell the student, and ask me if you want that automated.
 
 IF SOMETHING LOOKS WRONG
 - No green button: the OWNER_EMAILS value must match the email you sign in with exactly (capitals
   do not matter). Render restarts after you change it.
-- "Stripe problem" shown in the Control Room: it shows Stripe's own error message.
-- Payments of the old kind (Flutterwave) that are already in your database still count as revenue.
+- "A Flutterwave payment could not be confirmed": the student paid but something did not match
+  (amount, currency or email). The warning says which. Check the payment in your Flutterwave
+  dashboard; if it is real, use "Give a track" in the Control Room.
+- "Students cannot pay": the app needs BOTH FLW_PUBLIC_KEY and FLW_SECRET_KEY.
+- Payments that are already in your database still count as revenue.
