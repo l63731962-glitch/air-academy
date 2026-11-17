@@ -49,6 +49,23 @@ def key_mode(secret_key):
     return "test" if k.startswith(("sk_test_", "rk_test_")) else "live" if k.startswith(("sk_live_", "rk_live_")) else ""
 
 
+def flw_key_mode(key):
+    """'test', 'live' or '' from the look of a Flutterwave key (public FLWPUBK..., secret FLWSECK..., either one)."""
+    k = str(key or "").strip().upper()
+    if k.startswith(("FLWPUBK_TEST", "FLWSECK_TEST")):
+        return "test"
+    return "live" if k.startswith(("FLWPUBK", "FLWSECK")) else ""
+
+
+def whole_dollars(raw, lo=1, hi=200):
+    """FLW_USD_AMOUNT from the environment: a whole number of dollars between lo and hi, else 0 (meaning: no dollar option)."""
+    try:
+        n = int(str(raw or "").strip().lstrip("$"))
+    except ValueError:
+        return 0
+    return n if lo <= n <= hi else 0
+
+
 def checkout_form(*, tx_ref, uid, course_id, course_title, email, currency, amount_minor, success_url, cancel_url):
     """The form fields for POST /v1/checkout/sessions. The payment methods shown are decided in the Stripe Dashboard
     (Settings > Payment methods), so turning on a new one never needs a code change."""
