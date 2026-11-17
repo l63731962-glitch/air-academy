@@ -1,6 +1,6 @@
 # Air Academy (HTML + Python)
 
-Flask backend + plain HTML/CSS/JS frontend. Passwordless sign-in (6-digit email code), 11 tracks, 4,000 NGN per course, paid through Stripe (or Flutterwave until Stripe is switched on).
+Flask backend + plain HTML/CSS/JS frontend. Passwordless sign-in (6-digit email code), 11 tracks, 4,000 NGN per course, paid through Flutterwave (card, bank transfer and USSD for naira; an optional dollar price for international cards).
 
 ## Run it (PowerShell)
 
@@ -16,11 +16,10 @@ Open http://127.0.0.1:5000
 
 ## .env
 - `SECRET_KEY`: any long random string (`python -c "import secrets;print(secrets.token_hex(32))"`).
-- `STRIPE_SECRET_KEY`: Stripe dashboard > Developers > API keys. Starts `sk_test_` for testing and `sk_live_` for real money. When this is set (and the price below is valid) Stripe is the payment provider.
-- `STRIPE_WEBHOOK_SECRET`: starts `whsec_`, from the webhook endpoint you create in Stripe (see "Stripe payments" below).
-- `STRIPE_CURRENCY` (default `ngn`) and `STRIPE_AMOUNT` (the price in that currency, for example `4000` for NGN or `2.99` for USD). If you leave `STRIPE_AMOUNT` empty and the currency is `ngn`, it uses `PRICE_NGN` (4,000).
+- `FLW_PUBLIC_KEY` / `FLW_SECRET_KEY`: Flutterwave dashboard > Settings > API keys. Test keys contain `_TEST` (`FLWPUBK_TEST-...`), live keys do not (`FLWPUBK-...`). Both keys are needed; with only one the app treats payments as not set up. Use the pair from the same mode. The Control Room warns if test keys are left on a live site, because anyone could then "pay" with Flutterwave's test card and get a track free.
+- `FLW_WEBHOOK_HASH`: any long random string. Put the same value as "Secret hash" in Flutterwave > Settings > Webhooks, with URL `https://YOUR-DOMAIN/api/flutterwave/webhook`. It lets a payment unlock even if the student closes the page right after paying.
+- `FLW_USD_AMOUNT` (optional): a whole number of dollars, for example `3`. When set, students see a second button, "Paying from outside Nigeria? Pay $3 by international card", and are charged in US dollars (card only). Leave it unset for naira only. Check in your Flutterwave dashboard that your account can accept USD before you turn it on.
 - `OWNER_EMAILS`: your own email address (comma-separated if more than one). Only these accounts see the live-user counter and the Control Room. It is read on the server, so no one else can open it. Keep your address here on Render, not in the code.
-- `FLW_PUBLIC_KEY` / `FLW_SECRET_KEY`: Flutterwave, only used while `STRIPE_SECRET_KEY` is not set. Safe to remove once Stripe is live.
 - `SMTP_*`: your email provider. Leave `SMTP_HOST` empty in development and the 6-digit code prints in the terminal instead.
 - `FREE_ACCESS_EMAILS`: optional, comma-separated full email addresses that get every course free (enrolled automatically at sign-in, including courses added later).
 - `OPENAI_API_KEY`: powers every AI feature (project generator, Air Omega, picture maker). `OPENAI_MODEL` (default `gpt-4o-mini`) is the model for Air Omega's chat, practice questions, assignments and marking.
@@ -32,7 +31,6 @@ Open http://127.0.0.1:5000
   To lift a block early, delete that student's row from the `image_blocks` table in Supabase.
 - `PUBLIC_URL`: your site address, for example `https://air-academy.onrender.com`. Used for the links in parent and teacher emails.
 - `CRON_SECRET`: any long random string. It protects the weekly-email trigger (see "Weekly emails" below).
-- `FLW_WEBHOOK_HASH`: any random string; put the same value as "Secret hash" in Flutterwave > Settings > Webhooks, with URL `https://YOUR-DOMAIN/api/flutterwave/webhook`. Optional locally.
 
 ## Air Omega (the AI assistant)
 Every AI feature speaks as **Air Omega, Open Air Tech Space AI assistant**. All of it runs on the server, a failure never uses up a student's turn, and nothing is shown until the server has checked it.
@@ -65,21 +63,12 @@ Emails go out when something calls the trigger. Two ways, pick one:
 
 Running it twice is safe: an email is never sent twice for the same week. It needs `RESEND_API_KEY` and `RESEND_FROM` (already used for sign-in codes) and `PUBLIC_URL`.
 
-## Stripe payments
-**How it works.** Tapping Unlock creates a Stripe Checkout Session on the server and sends the student to Stripe's own payment page, so card details never touch this app. Stripe sends the student back, and the server asks Stripe what really happened. Stripe also calls the webhook. The track unlocks only when the amount, the currency, the reference, the student and the track all match what the server asked for. The price is always decided by the server.
-
-**Before you can take real money.** Stripe does not support businesses registered in Nigeria directly, and Naira card and bank-transfer payments are an invite-only Stripe preview for accounts outside Nigeria (money is paid out in dollars). Check your account at dashboard.stripe.com. The code works with any currency Stripe gives your account (`STRIPE_CURRENCY` and `STRIPE_AMOUNT`). Until Stripe is switched on, payments keep running on Flutterwave. Remember that Stripe also keeps a fixed 30 cents on every sale, which is a big share of a ₦4,000 sale (about $2.4), so check the numbers in the Control Room.
-
-**Set it up (test mode first).**
-1. In Stripe, turn on **Test mode**. Copy the secret key (`sk_test_...`) into Render as `STRIPE_SECRET_KEY`. Set `STRIPE_CURRENCY` and `STRIPE_AMOUNT`.
-2. Stripe > Developers > Webhooks > **Add endpoint**. URL: `https://YOUR-DOMAIN/api/stripe/webhook`. Events to send: `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`, `checkout.session.expired`, `charge.refunded`, `charge.dispute.created`.
-3. Copy the signing secret (`whsec_...`) into Render as `STRIPE_WEBHOOK_SECRET`. Render restarts by itself.
-4. Pay with the Stripe test card `4242 4242 4242 4242`, any future date, any CVC. The track unlocks when you come back. Open the Control Room > Setup check to see the webhook arrive.
-5. When it all works, swap in the live key (`sk_live_...`) and a new live webhook secret. The Control Room warns you if a test key is left on a live site.
-
-**Which payment methods show** (cards, bank transfer, and so on) is set in Stripe > Settings > Payment methods, with no code change.
-**Refunds.** Refund in the Stripe dashboard. A full refund takes the track back automatically. A dispute flags the payment and emails you, and the student keeps access until you decide.
-**Old Flutterwave payments** stay valid and are counted in revenue.
+## Flutterwave payments
+**How it works.** Tapping Unlock asks the server for a payment reference and the price (the server always decides the price), then opens Flutterwave's checkout. When the student pays, the server asks Flutterwave what really happened (`/v3/transactions/{id}/verify`) and unlocks the track only if the status, reference, currency, amount and the student's email all match. Flutterwave also calls the webhook as a safety net. Naira payments offer card, bank transfer and USSD. If `FLW_USD_AMOUNT` is set, a student outside Nigeria can pay that many dollars by card instead.
+**Money that was paid but not confirmed.** If Flutterwave says a payment was successful but something did not match (wrong amount, wrong email, and so on) the Control Room shows a warning with the reason for 3 days. Check the payment in your Flutterwave dashboard and use **Give a track** if it is real.
+**Fees.** The Control Room estimates Flutterwave's fee (default 1.4% of a naira sale, capped at ₦2,000, and 3.8% of a dollar sale). These are editable under Plans; your Flutterwave dashboard shows the real rate for your account.
+**Refunds** are made in the Flutterwave dashboard. The app does not take a track back automatically on a Flutterwave refund.
+**Stripe is switched off.** The Stripe code is still in the app but does nothing unless `STRIPE_SECRET_KEY` is set on Render. Do not add any `STRIPE_*` variable.
 
 ## Live users and the Control Room (owner only)
 Set `OWNER_EMAILS` to your email. Sign in with it and the dashboard shows a green **N live · Control Room** button.
@@ -92,14 +81,14 @@ Set `OWNER_EMAILS` to your email. Sign in with it and the dashboard shows a gree
 - It is private on the server: everyone else gets a "not found" answer from every owner address, and the page's code is only downloaded when you tap the button. The only thing a student's device keeps is a random id per tab for the ping.
 
 ## Test a payment
-Sign in, open a locked course, tap **Unlock**. With Stripe on, you land on Stripe's page (test card `4242 4242 4242 4242`); with Flutterwave, use one of their test cards (test keys only). The track unlocks without a reload.
+Sign in, open a locked course, tap **Unlock**. Use Flutterwave's test keys and one of their test cards (never on the live site: see the warning above). The track unlocks without a reload.
 
 ## Deploy
 On Render: **Root Directory** `air_academy_web`, build command `pip install -r requirements.txt`, and start command `gunicorn app:app --workers 2 --threads 4 --timeout 120` (one plain worker would stop answering everyone while it waits for OpenAI). Set `APP_ENV=production`, a real `SECRET_KEY`, `DATABASE_URL` (Supabase), `RESEND_API_KEY` / `RESEND_FROM`, and serve over HTTPS. Never set `DEMO_UNLOCK` there. On Windows use `waitress-serve app:app`.
 
 ## Files
-- `app.py`: API, OTP auth, payments (Stripe and Flutterwave), live users, owner routes, database schema
-- `billing.py`: Stripe helpers with no database in them (price in minor units, checkout form, webhook signature check, what a session means)
+- `app.py`: API, OTP auth, payments (Flutterwave; Stripe is dormant), live users, owner routes, database schema
+- `billing.py`: payment helpers with no database in them (Flutterwave key mode and dollar price; the dormant Stripe checkout form, webhook signature check and session check)
 - `control.py`: the Control Room's maths with no database in it (price lists, plans, projections, warnings, what-if)
 - `static/live.js` (the ping) and `static/owner.js` (the Control Room, loaded only for the owner)
 - `assistant.js`: Air Omega everywhere: the floating panel, quick commands, the actions it can run, and the memory panel
@@ -110,7 +99,7 @@ On Render: **Root Directory** `air_academy_web`, build command `pip install -r r
 - `static/index.html`, `style.css`, `app.js`: the whole UI
 
 ## Free lessons, the paywall and the animation tracks
-- **Price.** `PRICE_NGN = 4000` in `app.py` is the only price the server charges. `PRICE` in `static/app.js` is only a fallback: the screen shows whatever price the server reports (Stripe's price when Stripe is on). `ACCEPTED_PRICES` also accepts the old 3,500 so a payment that was started before the price change still verifies.
+- **Price.** `PRICE_NGN = 4000` in `app.py` is the only price the server charges. `PRICE` in `static/app.js` is only a fallback: the screen shows whatever price the server reports (the dollar price too, when `FLW_USD_AMOUNT` is set). `ACCEPTED_PRICES` also accepts the old 3,500 so a payment that was started before the price change still verifies.
 - **Free lessons.** `FREE_LESSONS = {"prompt-engineering": 2}` in `app.py`. Signed-in students can read and take the quiz for those lessons without paying. Everything else stays locked, and the server enforces it: locked lesson text is never sent. The AI helpers (mentor, pictures, assignments, playgrounds, exam, CA) stay for people who bought the course because they cost money. To change the free lessons, edit that one line.
 - **New tracks.** `2d-animation` (2D Animation Fundamentals), `3d-animation` (3D Animation Mastery) and `ai-animation` (AI Animation and Storytelling), five lessons each (`lessons_2d_animation.py`, `lessons_3d_animation.py`, `lessons_ai_animation.py`). They are added to the database automatically at start-up. The Animation Masterclass is unchanged. Existing class numbers do not change: the new tracks are classes 9, 10 and 11.
 - **Dashboard.** Topic tabs (All, 2D Animation, 3D Animation, AI Animation) sit under the search box. The lesson page has a syllabus sidebar that marks lessons Free, Locked or Done. Tapping a locked lesson, or "Continue to Lesson 3", opens the unlock pop-up.
