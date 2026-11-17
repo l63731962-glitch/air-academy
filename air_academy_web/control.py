@@ -147,6 +147,9 @@ SETTINGS = {   # key: (kind, lowest, highest, default)
     "resend_usd": ("num", 0, 5000, 0),
     "resend_month_limit": ("int", 0, 100000000, 3000),
     "resend_day_limit": ("int", 0, 100000000, 100),
+    "flw_fee_pct": ("num", 0, 20, 1.4),             # Flutterwave's cut of a naira sale, in percent (check your dashboard for your own rate)
+    "flw_fee_cap_ngn": ("int", 0, 1000000, 2000),   # ...which Flutterwave caps at this many naira per sale
+    "flw_intl_fee_pct": ("num", 0, 20, 3.8),        # Flutterwave's cut of a dollar (international card) sale, in percent
     "stripe_fee_pct": ("num", 0, 20, 2.9),
     "stripe_fee_fixed_usd": ("num", 0, 5, 0.30),
     "alert_emails": ("int", 0, 1, 1),               # 1 = email me when something needs attention
@@ -210,6 +213,21 @@ def stripe_fee_usd(price_usd, s):
     return price_usd * s["stripe_fee_pct"] / 100 + s["stripe_fee_fixed_usd"]
 
 
+def flw_fee_usd(amount_usd, currency, s):
+    """What Flutterwave keeps from one sale, as an estimate. Naira sales pay a small percentage with a cap; sales in another currency
+    (international cards) pay a higher percentage."""
+    if str(currency or "").lower() == "ngn":
+        rate = s["usd_ngn"] or 1
+        pct = amount_usd * s["flw_fee_pct"] / 100
+        return min(pct, s["flw_fee_cap_ngn"] / rate) if s["flw_fee_cap_ngn"] else pct
+    return amount_usd * s["flw_intl_fee_pct"] / 100
+
+
+def payment_fee_usd(provider, currency, amount_usd, s):
+    """The provider's cut of one sale, in dollars. `provider` is 'stripe' or 'flutterwave'."""
+    return stripe_fee_usd(amount_usd, s) if provider == "stripe" else flw_fee_usd(amount_usd, currency, s)
+
+
 # ───────────────────────── "What if I had N students?" ─────────────────────────
 ASSUMED = {"openai_usd": 0.30, "emails": 3.0, "db_mb": 2.0, "live_ratio": 0.08}   # used until there are enough real students to measure
 MEASURE_MIN = 10   # active students needed before the real averages are trusted
@@ -239,12 +257,13 @@ def pick_tier(tiers, need, cap_index):
     return tiers[-1], True
 
 
-def whatif(students, per, s, price_usd, buy_rate):
+def whatif(students, per, s, price_usd, buy_rate, provider="flutterwave", currency="ngn"):
     """Monthly running costs for `students` active students a month.
 
     per: openai_usd (per student), emails (per student), db_mb (per student), base_mb (what the database weighs with no students),
          live_ratio (the share of a month's students online at the same time, at the busiest moment).
-    s: the settings. price_usd: what one track sells for, in dollars. buy_rate: share of students who buy a track in a month (0 to 1)."""
+    s: the settings. price_usd: what one track sells for, in dollars. buy_rate: share of students who buy a track in a month (0 to 1).
+    provider, currency: who takes the payment and in which currency, which decide the fee."""
     n = max(0, int(students))
     openai = n * per["openai_usd"]
     emails = n * per["emails"]
@@ -256,7 +275,7 @@ def whatif(students, per, s, price_usd, buy_rate):
     live = n * per["live_ratio"]
     ptier, pover = pick_tier(RENDER_TIERS[1:], live, 2)   # never suggest the Free plan for a paid app: it goes to sleep when idle
     sales = n * buy_rate
-    fee = price_usd * s["stripe_fee_pct"] / 100 + s["stripe_fee_fixed_usd"]
+    fee = payment_fee_usd(provider, currency, price_usd, s)
     fees = sales * fee
     total = openai + resend + supabase + ptier[1] + fees
     net_per_sale = max(price_usd - fee, 0.01)
@@ -264,7 +283,7 @@ def whatif(students, per, s, price_usd, buy_rate):
     return {"students": n, "live": round(live, 1), "sales": round(sales, 1),
             "openai": round(openai, 2), "resend": {"usd": round(resend, 2), "plan": rtier[0], "emails": round(emails), "tooSmall": rover},
             "supabase": {"usd": round(supabase, 2), "plan": stier[0], "mb": round(mb), "tooSmall": sover},
-            "render": {"usd": ptier[1], "plan": ptier[0], "tooSmall": pover}, "stripeFees": round(fees, 2),
+            "render": {"usd": ptier[1], "plan": ptier[0], "tooSmall": pover}, "fees": round(fees, 2),
             "totalUsd": round(total, 2), "perStudentUsd": round(total / n, 3) if n else 0,
             "revenueUsd": round(sales * price_usd, 2), "profitUsd": round(sales * price_usd - total, 2),
             "breakEvenSales": math.ceil((openai + fixed) / net_per_sale) if (openai + fixed) > 0 else 0}
@@ -283,6 +302,7 @@ def evaluate(m, s):
 
     m: openai{mtd, projected, on}, resend{month, day, on}, supabase{db_bytes, images_bytes, images_n},
        render{peak_live, paid_students}, stripe{provider, mode, webhook_seen, stripe_sales, production},
+       flw{mode, webhook_hash, webhook_seen, sales, recent_error, production},
        money{cost_projected, revenue_projected, day_of_month}."""
     out = []
 
@@ -335,14 +355,25 @@ def evaluate(m, s):
     if s["render_usd"] == 0 and rd.get("paid_students", 0) > 0:
         add("render_free", "warn", "Free Render plan with paying students", "Free Render services go to sleep when idle, so the first student of the day waits a long time. Starter ($7/month) stays awake.")
 
-    st = m.get("stripe") or {}
-    if st.get("provider") == "flutterwave":
-        add("pay_provider", "info", "Payments are still on Flutterwave", "Stripe is not switched on yet. Add STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET on Render and the app switches to Stripe by itself.")
-    elif st.get("provider") is None:
-        add("pay_none", "bad", "Students cannot pay", "No payment provider is set up. Add STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET on Render.")
-    elif st.get("provider") == "stripe":
+    st, fw = m.get("stripe") or {}, m.get("flw") or {}
+    prov = st.get("provider")
+    if prov is None:
+        add("pay_none", "bad", "Students cannot pay", "No payment provider is set up. Add FLW_PUBLIC_KEY, FLW_SECRET_KEY and FLW_WEBHOOK_HASH on Render (Flutterwave > Settings > API keys).")
+    elif prov == "flutterwave":
+        if fw.get("production") and fw.get("mode") == "test":
+            add("flw_test", "bad", "Flutterwave is in TEST mode", "The keys on Render are Flutterwave test keys. Anyone can pay with Flutterwave's test card and get a track free, and real cards will not work. Swap in your live keys (FLWPUBK-... and FLWSECK-...).")
+        elif fw.get("mode") == "mixed":
+            add("flw_mixed", "bad", "Your two Flutterwave keys do not match", "One key is a test key and the other is live. A student could be charged and the app would not be able to confirm it. Copy both keys from the same mode in Flutterwave > Settings > API keys.")
+        if not fw.get("webhook_hash"):
+            add("flw_hash", "warn", "Flutterwave webhook is not set up", "Without it, a student who closes the page right after paying may not get the track. In Flutterwave > Settings > Webhooks, add your site's /api/flutterwave/webhook address and a secret hash, then put the same hash in FLW_WEBHOOK_HASH on Render.")
+        elif not fw.get("webhook_seen"):
+            add("flw_webhook", "warn" if fw.get("sales", 0) else "info", "Flutterwave has not called your webhook yet",
+                "Nothing received yet. Check the webhook address and that the secret hash in Flutterwave is the same as FLW_WEBHOOK_HASH on Render.")
+        if fw.get("recent_error"):
+            add("flw_rejected", "warn", "A Flutterwave payment could not be confirmed", f"{fw['recent_error']} If the student really paid, check the payment in your Flutterwave dashboard and use Give a track in this Control Room.")
+    elif prov == "stripe":
         if st.get("production") and st.get("mode") == "test":
-            add("stripe_test", "bad", "Stripe is in TEST mode", "The key on Render is a test key, so real students cannot pay. Swap in the live key (it starts with sk_live_).")
+            add("stripe_test", "bad", "Stripe is in TEST mode", "The key on Render is a test key. Anyone can pay with Stripe's test card and get a track free, and real cards will not work. Swap in the live key (it starts with sk_live_).")
         if not st.get("webhook_seen"):
             add("stripe_webhook", "warn" if st.get("stripe_sales", 0) else "info", "Stripe webhook not heard yet",
                 "Stripe has not called the webhook yet. Add the endpoint in Stripe and copy its signing secret into STRIPE_WEBHOOK_SECRET, so bank-transfer payments unlock even if the student closes the page.")
