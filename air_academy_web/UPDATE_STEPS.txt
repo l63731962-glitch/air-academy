@@ -1,91 +1,96 @@
-AIR ACADEMY: LIVE USERS + CONTROL ROOM UPDATE (payments stay on FLUTTERWAVE)
-============================================================================
+AIR ACADEMY: PAYSTACK + LIVE USERS + CONTROL ROOM UPDATE
+========================================================
 
 WHAT YOU GET
-- Payments stay on Flutterwave. Stripe is switched OFF and stays off unless you add a Stripe key,
-  which you will not do. Do not add any variable that starts with STRIPE_.
+- Payments run on PAYSTACK only. Flutterwave and Stripe are gone from the app.
+- Paystack needs ONE key on Render. No webhook password, no public key.
+- A student taps Unlock, pays on Paystack's secure page (card, bank transfer or USSD), comes back
+  to your site, and the course opens by itself.
 - A green "N live - Control Room" button on YOUR dashboard only. It shows how many people are
   using the app right now (one person = 1, two = 2, and so on), refreshed every few seconds.
 - The Control Room (only your email can open it): live users, an OpenAI/Resend/Supabase/Render
-  cost meter with warnings and email alerts, this month's bill with Flutterwave's fees counted,
+  cost meter with warnings and email alerts, this month's bill with Paystack's fees counted,
   a "what if I had 1,000 students" slider, sales, sign-ups, a launch checklist, and a tool to give
   a student a track.
-- It warns you (red) if Flutterwave TEST keys are left on your live site. Test keys would let
-  anyone "pay" with Flutterwave's test card and get a track free.
-- OPTIONAL: a dollar price for students outside Nigeria (see STEP 3).
-- Your students' accounts, courses and payments are NOT touched. New tables are added by
-  themselves when the app starts.
+- It warns you (red) if a Paystack TEST key is left on your live site.
+- Your students' accounts, courses and payments are NOT touched. Old payments stay counted as
+  sales. New tables are added by themselves when the app starts.
 
 STEP 1. COPY THE FILES (PowerShell, inside the folder that has app.py)
 
-    Expand-Archive -Path "$HOME\Downloads\air_academy_flutterwave_control_room.zip" -DestinationPath . -Force
+    Expand-Archive -Path "$HOME\Downloads\air_academy_paystack_control_room.zip" -DestinationPath . -Force
 
 This adds billing.py, control.py, static/live.js, static/owner.js and replaces app.py, omega.py,
 README.md and the static files. It does not touch your .env, your database or your lesson files.
-(Use THIS zip, not the earlier Stripe one. It contains everything.)
+(Use THIS zip, not the earlier ones. It contains everything.)
 
 STEP 2. RENDER SETTINGS (Dashboard > your service > Environment)
 
-    OWNER_EMAILS = your-own-gmail-address@gmail.com   (the Gmail you sign in with)
+    OWNER_EMAILS       = your-own-gmail-address@gmail.com   (the Gmail you sign in with)
+    PAYSTACK_SECRET_KEY = sk_live_...
 
-Type your real address here on Render only. It is deliberately not in the code or in this file,
-because your code is on public GitHub.
+Type your real address in OWNER_EMAILS on Render only. It is deliberately not in the code or in
+this file, because your code is on public GitHub.
 
-Your Flutterwave keys (Flutterwave dashboard > Settings > API keys):
+Where the Paystack key is: Paystack dashboard > Settings > API Keys & Webhooks. Copy the
+SECRET key (it starts with sk_live_). Do NOT use the public key (starts with pk_live_): it cannot
+confirm payments, and the Control Room will tell you if you paste it by mistake.
+Never send the secret key to anybody, not even to me.
 
-    FLW_PUBLIC_KEY   = FLWPUBK-...      (LIVE key: no "_TEST" in it)
-    FLW_SECRET_KEY   = FLWSECK-...      (LIVE key: no "_TEST" in it)
-    FLW_WEBHOOK_HASH = any long random password you make up (letters and numbers)
-
-Use the pair from the same mode. A test key and a live key together will not work.
+Delete these from Render if they exist (the app no longer reads them):
+    FLW_PUBLIC_KEY, FLW_SECRET_KEY, FLW_WEBHOOK_HASH, FLW_USD_AMOUNT, and anything starting STRIPE_
 
 Also check:
   - APP_ENV=production
   - DEMO_UNLOCK must NOT exist
-  - If you added any STRIPE_ variable earlier (STRIPE_SECRET_KEY, STRIPE_CURRENCY, STRIPE_AMOUNT,
-    STRIPE_WEBHOOK_SECRET), DELETE them. With no Stripe key the app uses Flutterwave.
 
 Settings > Start Command (so one slow OpenAI answer does not freeze everybody else). Your repository
 has a folder called air_academy_web, so the command is:
 
     gunicorn --chdir air_academy_web app:app --workers 2 --threads 4 --timeout 120
 
-STEP 3. OPTIONAL: LET STUDENTS OUTSIDE NIGERIA PAY IN DOLLARS
-Add on Render:
+STEP 3. PAYSTACK DASHBOARD (two small things)
 
-    FLW_USD_AMOUNT = 3        (a whole number of dollars; pick your own price)
+A. Webhook (so a payment unlocks even if the student closes the page right after paying):
+   Settings > API Keys & Webhooks > "Live Webhook URL", paste:
 
-Then every locked course shows a second button under the naira button:
-"Paying from outside Nigeria? Pay $3 by international card". Dollar payments are card only
-(Flutterwave offers bank transfer and USSD for naira only). Leave FLW_USD_AMOUNT out and the app
-is naira only, exactly as before.
-Before you turn it on, check two things with Flutterwave (dashboard or support chat):
-  1. Your account is allowed to accept payments in US dollars.
-  2. How and when your dollar sales are paid out to you (in dollars or in naira).
-Flutterwave charges more for international cards (often up to about 3.8%). The Control Room
-estimates it and you can correct the rate under Plans. Do one real test purchase with an
-international card before you announce it.
+       https://YOUR-SITE.onrender.com/api/paystack/webhook
 
-STEP 4. FLUTTERWAVE WEBHOOK (so a payment unlocks even if the student closes the page)
-Flutterwave dashboard > Settings > Webhooks:
-  - URL:         https://YOUR-SITE.onrender.com/api/flutterwave/webhook
-  - Secret hash: exactly the same value you put in FLW_WEBHOOK_HASH on Render
+   Save. (Use your real Render address in place of YOUR-SITE.onrender.com.)
 
-STEP 5. PUSH
+B. Students outside Nigeria: Settings > Preferences, find the international payments option and
+   request it. Paystack reviews it, usually within a couple of working days. After it is approved,
+   a student abroad pays the same N4,000 with their own card and their bank converts the money.
+   Until it is approved, foreign cards are declined. Nothing is needed in the app for this.
+   (A separate dollar price is not part of this update. It would need a US dollar account with
+   Paystack's partner bank.)
+
+STEP 4. PUSH
 
     git add .
-    git commit -m "Live users, Control Room and optional dollar price"
+    git commit -m "Paystack payments, live users and Control Room"
     git push
 
 Render rebuilds. Sign in with your Gmail: you will see the green Control Room button.
 
+STEP 5. TEST ONE REAL PAYMENT
+Sign up with a second email (a spare Gmail), open a locked course, tap Unlock and pay N4,000 with
+your own card or by bank transfer. The course should open by itself. This is the only way to be
+sure everything is connected, so please do it before you announce anything. Paystack pays the
+money out to your bank on its normal schedule, minus its fee.
+
 STEP 6. OPEN THE CONTROL ROOM > SETUP CHECK, THEN PLANS
-Setup check should show green ticks for "Flutterwave keys (live mode)", the webhook secret hash and
-(after the first real payment) "Flutterwave webhook heard". A red cross means act now; read its note.
+Setup check should show green ticks for "Paystack key (live mode)" and, after the first real
+payment, "Paystack webhook heard". A red cross means act now; read its note.
 Then open Plans and tell it what you really pay (Render plan, Supabase plan, Resend plan, how much
-OpenAI you are willing to spend, naira per dollar, Flutterwave fee). Pick a plan from each list or
+OpenAI you are willing to spend, naira per dollar, Paystack fee). Pick a plan from each list or
 type your own numbers, then Save. Until you do, it uses free-plan defaults and the warnings will
 not match your real bill. Press "Send a test alert" and confirm the email reaches you (check spam).
+
+PAYSTACK FEES (so there are no surprises)
+Paystack keeps about 1.5% plus N100 from a local card payment. On a N4,000 course that is about
+N160, so you receive about N3,840. Foreign cards cost more (about 3.9% plus N100). The Control Room
+estimates these and you can correct the rates under Plans. Your Paystack dashboard shows the exact fee.
 
 HOW THE LIVE COUNT WORKS
 Every open tab pings the server every 30 seconds. Someone counts for 75 seconds after their last
@@ -95,20 +100,25 @@ a visitor. Or tap "Count me too" in the Live section.
 
 ABOUT THE COST NUMBERS
 They are estimates. OpenAI is counted from tokens at the public price list, so compare with
-platform.openai.com now and then. Render, Supabase and Resend use the plans you enter. Flutterwave's
-fee is estimated from the rates under Plans (check your own rate in your Flutterwave dashboard).
+platform.openai.com now and then. Render, Supabase and Resend use the plans you enter. Paystack's
+fee is estimated from the rates under Plans.
 The "what if" slider assumes about 30 cents of AI per active student a month until you have 10
 active students; after that it uses what your real students actually cost.
 
 REFUNDS
-Refund in the Flutterwave dashboard. The app does not take the track back automatically on a
-Flutterwave refund, so tell the student, and ask me if you want that automated.
+Refund in the Paystack dashboard. The app does not take the track back automatically, so tell the
+student, and ask me if you want that automated.
 
 IF SOMETHING LOOKS WRONG
 - No green button: the OWNER_EMAILS value must match the email you sign in with exactly (capitals
   do not matter). Render restarts after you change it.
-- "A Flutterwave payment could not be confirmed": the student paid but something did not match
-  (amount, currency or email). The warning says which. Check the payment in your Flutterwave
-  dashboard; if it is real, use "Give a track" in the Control Room.
-- "Students cannot pay": the app needs BOTH FLW_PUBLIC_KEY and FLW_SECRET_KEY.
+- "A Paystack payment had a problem": the student paid but something did not match (amount,
+  currency or email), or Paystack refused to start a payment (usually a wrong key). The warning
+  says which. If a student really paid, check it in your Paystack dashboard and use "Give a track"
+  in the Control Room.
+- "Students cannot pay": PAYSTACK_SECRET_KEY is missing, or it is the public key (pk_...). Use the
+  secret key (sk_live_...).
+- A student paid, came back, and the course did not open: wait a minute and refresh. The webhook
+  finishes it. If the course is still locked after 5 minutes, check Setup check for the webhook tick.
+- A foreign card is declined: international payments are not approved yet in Paystack (Step 3B).
 - Payments that are already in your database still count as revenue.
