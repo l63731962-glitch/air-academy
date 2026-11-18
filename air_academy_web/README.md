@@ -1,6 +1,6 @@
 # Air Academy (HTML + Python)
 
-Flask backend + plain HTML/CSS/JS frontend. Passwordless sign-in (6-digit email code), 11 tracks, 4,000 NGN per course, paid through Flutterwave (card, bank transfer and USSD for naira; an optional dollar price for international cards).
+Flask backend + plain HTML/CSS/JS frontend. Passwordless sign-in (6-digit email code), 11 tracks, 4,000 NGN per course, paid through Paystack (card, bank transfer and USSD; students abroad can pay with an international card once you switch that on in Paystack).
 
 ## Run it (PowerShell)
 
@@ -16,9 +16,9 @@ Open http://127.0.0.1:5000
 
 ## .env
 - `SECRET_KEY`: any long random string (`python -c "import secrets;print(secrets.token_hex(32))"`).
-- `FLW_PUBLIC_KEY` / `FLW_SECRET_KEY`: Flutterwave dashboard > Settings > API keys. Test keys contain `_TEST` (`FLWPUBK_TEST-...`), live keys do not (`FLWPUBK-...`). Both keys are needed; with only one the app treats payments as not set up. Use the pair from the same mode. The Control Room warns if test keys are left on a live site, because anyone could then "pay" with Flutterwave's test card and get a track free.
-- `FLW_WEBHOOK_HASH`: any long random string. Put the same value as "Secret hash" in Flutterwave > Settings > Webhooks, with URL `https://YOUR-DOMAIN/api/flutterwave/webhook`. It lets a payment unlock even if the student closes the page right after paying.
-- `FLW_USD_AMOUNT` (optional): a whole number of dollars, for example `3`. When set, students see a second button, "Paying from outside Nigeria? Pay $3 by international card", and are charged in US dollars (card only). Leave it unset for naira only. Check in your Flutterwave dashboard that your account can accept USD before you turn it on.
+- `PAYSTACK_SECRET_KEY`: Paystack dashboard > Settings > API Keys & Webhooks > Secret Key. Test keys start with `sk_test_`, live keys with `sk_live_`. Use the SECRET key, not the public one (`pk_...`): a public key cannot confirm payments, so the app treats it as not set up. The same key signs Paystack's webhook calls, so there is no separate webhook password. The Control Room warns if a test key is left on a live site, because real cards would not work and no money would reach you.
+- Webhook (safety net so a payment unlocks even if the student closes the page right after paying): Paystack > Settings > API Keys & Webhooks > **Live Webhook URL** = `https://YOUR-DOMAIN/api/paystack/webhook`. Nothing to add on Render for it.
+- `PUBLIC_URL` (optional): your site's address, for example `https://YOUR-SITE.onrender.com`. Paystack sends students back here after paying. When it is not set the app uses the address the student is visiting, which is correct on Render.
 - `OWNER_EMAILS`: your own email address (comma-separated if more than one). Only these accounts see the live-user counter and the Control Room. It is read on the server, so no one else can open it. Keep your address here on Render, not in the code.
 - `SMTP_*`: your email provider. Leave `SMTP_HOST` empty in development and the 6-digit code prints in the terminal instead.
 - `FREE_ACCESS_EMAILS`: optional, comma-separated full email addresses that get every course free (enrolled automatically at sign-in, including courses added later).
@@ -63,12 +63,13 @@ Emails go out when something calls the trigger. Two ways, pick one:
 
 Running it twice is safe: an email is never sent twice for the same week. It needs `RESEND_API_KEY` and `RESEND_FROM` (already used for sign-in codes) and `PUBLIC_URL`.
 
-## Flutterwave payments
-**How it works.** Tapping Unlock asks the server for a payment reference and the price (the server always decides the price), then opens Flutterwave's checkout. When the student pays, the server asks Flutterwave what really happened (`/v3/transactions/{id}/verify`) and unlocks the track only if the status, reference, currency, amount and the student's email all match. Flutterwave also calls the webhook as a safety net. Naira payments offer card, bank transfer and USSD. If `FLW_USD_AMOUNT` is set, a student outside Nigeria can pay that many dollars by card instead.
-**Money that was paid but not confirmed.** If Flutterwave says a payment was successful but something did not match (wrong amount, wrong email, and so on) the Control Room shows a warning with the reason for 3 days. Check the payment in your Flutterwave dashboard and use **Give a track** if it is real.
-**Fees.** The Control Room estimates Flutterwave's fee (default 1.4% of a naira sale, capped at ₦2,000, and 3.8% of a dollar sale). These are editable under Plans; your Flutterwave dashboard shows the real rate for your account.
-**Refunds** are made in the Flutterwave dashboard. The app does not take a track back automatically on a Flutterwave refund.
-**Stripe is switched off.** The Stripe code is still in the app but does nothing unless `STRIPE_SECRET_KEY` is set on Render. Do not add any `STRIPE_*` variable.
+## Paystack payments
+**How it works.** Tapping Unlock asks the server to start a payment (the server always decides the price: ₦4,000, sent to Paystack in kobo) and sends the student to Paystack's own secure page. Card, bank transfer and USSD are offered there. Paystack then returns the student to the site with a reference, and the server asks Paystack what really happened (`/transaction/verify/{reference}`). The track unlocks only if the status, reference, currency, amount and the student's email all match. Paystack also calls the webhook (`/api/paystack/webhook`, signed with HMAC-SHA512 using your secret key) as a safety net. A bank transfer can take a few minutes to clear: the page keeps checking and the webhook finishes it if the student leaves.
+**Students outside Nigeria.** They pay the same ₦4,000 with an international card and their own bank converts it. Paystack does not switch international cards on by default: in the Paystack dashboard go to Settings > Preferences and request international payments (it can take a couple of working days). Until then foreign cards are declined.
+**Money that was paid but not confirmed.** If Paystack says a payment was successful but something did not match (wrong amount, wrong email, and so on) the Control Room shows a warning with the reason for 3 days. Check the payment in your Paystack dashboard and use **Give a track** if it is real. If Paystack refuses to start a payment at all (a wrong key, for example) the same warning appears.
+**Fees.** The Control Room estimates Paystack's fee for a local card: 1.5% plus ₦100 (the ₦100 is not charged on sales under ₦2,500), never more than ₦2,000. On a ₦4,000 sale that is about ₦160. Foreign cards cost more (about 3.9% plus ₦100). The numbers are editable under Plans; your Paystack dashboard shows the real fee.
+**Refunds** are made in the Paystack dashboard. The app does not take a track back automatically on a refund.
+**Older payments.** Payments made before Paystack was switched on keep their original label and still count as sales in the Control Room.
 
 ## Live users and the Control Room (owner only)
 Set `OWNER_EMAILS` to your email. Sign in with it and the dashboard shows a green **N live · Control Room** button.
@@ -81,14 +82,14 @@ Set `OWNER_EMAILS` to your email. Sign in with it and the dashboard shows a gree
 - It is private on the server: everyone else gets a "not found" answer from every owner address, and the page's code is only downloaded when you tap the button. The only thing a student's device keeps is a random id per tab for the ping.
 
 ## Test a payment
-Sign in, open a locked course, tap **Unlock**. Use Flutterwave's test keys and one of their test cards (never on the live site: see the warning above). The track unlocks without a reload.
+Sign in, open a locked course, tap **Unlock**. Use your Paystack test key (`sk_test_...`) and one of Paystack's test cards (never on the live site: see the warning above). Paystack's test mode needs the webhook URL in the **Test Webhook URL** box. The track unlocks without a reload.
 
 ## Deploy
 On Render: **Root Directory** `air_academy_web`, build command `pip install -r requirements.txt`, and start command `gunicorn app:app --workers 2 --threads 4 --timeout 120` (one plain worker would stop answering everyone while it waits for OpenAI). Set `APP_ENV=production`, a real `SECRET_KEY`, `DATABASE_URL` (Supabase), `RESEND_API_KEY` / `RESEND_FROM`, and serve over HTTPS. Never set `DEMO_UNLOCK` there. On Windows use `waitress-serve app:app`.
 
 ## Files
-- `app.py`: API, OTP auth, payments (Flutterwave; Stripe is dormant), live users, owner routes, database schema
-- `billing.py`: payment helpers with no database in them (Flutterwave key mode and dollar price; the dormant Stripe checkout form, webhook signature check and session check)
+- `app.py`: API, OTP auth, payments (Paystack), live users, owner routes, database schema
+- `billing.py`: small payment helpers with no database in them (price text, Paystack key mode, webhook signature check, what a payment confirmation must match)
 - `control.py`: the Control Room's maths with no database in it (price lists, plans, projections, warnings, what-if)
 - `static/live.js` (the ping) and `static/owner.js` (the Control Room, loaded only for the owner)
 - `assistant.js`: Air Omega everywhere: the floating panel, quick commands, the actions it can run, and the memory panel
@@ -99,7 +100,7 @@ On Render: **Root Directory** `air_academy_web`, build command `pip install -r r
 - `static/index.html`, `style.css`, `app.js`: the whole UI
 
 ## Free lessons, the paywall and the animation tracks
-- **Price.** `PRICE_NGN = 4000` in `app.py` is the only price the server charges. `PRICE` in `static/app.js` is only a fallback: the screen shows whatever price the server reports (the dollar price too, when `FLW_USD_AMOUNT` is set). `ACCEPTED_PRICES` also accepts the old 3,500 so a payment that was started before the price change still verifies.
+- **Price.** `PRICE_NGN = 4000` in `app.py` is the only price the server charges. `PRICE` in `static/app.js` is only a fallback: the screen shows whatever price the server reports. `ACCEPTED_PRICES` also accepts the old 3,500 so a payment that was started before the price change still verifies.
 - **Free lessons.** `FREE_LESSONS = {"prompt-engineering": 2}` in `app.py`. Signed-in students can read and take the quiz for those lessons without paying. Everything else stays locked, and the server enforces it: locked lesson text is never sent. The AI helpers (mentor, pictures, assignments, playgrounds, exam, CA) stay for people who bought the course because they cost money. To change the free lessons, edit that one line.
 - **New tracks.** `2d-animation` (2D Animation Fundamentals), `3d-animation` (3D Animation Mastery) and `ai-animation` (AI Animation and Storytelling), five lessons each (`lessons_2d_animation.py`, `lessons_3d_animation.py`, `lessons_ai_animation.py`). They are added to the database automatically at start-up. The Animation Masterclass is unchanged. Existing class numbers do not change: the new tracks are classes 9, 10 and 11.
 - **Dashboard.** Topic tabs (All, 2D Animation, 3D Animation, AI Animation) sit under the search box. The lesson page has a syllabus sidebar that marks lessons Free, Locked or Done. Tapping a locked lesson, or "Continue to Lesson 3", opens the unlock pop-up.
