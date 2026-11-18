@@ -1,7 +1,8 @@
-"""Open Air Tech Space: Flask backend. Accounts (name, date of birth, gender, password) verified by email code (sent through Resend), progress, quizzes, CA record, exams, certificates, project studio + Stripe paywall (4,000 NGN per course; some lessons are free previews), plus an owner-only Control Room (live users, costs, sales)."""
+"""Open Air Tech Space: Flask backend. Accounts (name, date of birth, gender, password) verified by email code (sent through Resend), progress, quizzes, CA record, exams, certificates, project studio + Paystack paywall (4,000 NGN per course; some lessons are free previews), plus an owner-only Control Room (live users, costs, sales)."""
 import base64, hashlib, hmac, json, logging, math, os, random, re, secrets, threading, time, uuid
 from datetime import date, datetime, timedelta, timezone
 from functools import wraps
+from urllib.parse import quote
 
 import psycopg
 import requests
@@ -22,14 +23,11 @@ load_dotenv()
 
 ENV = os.getenv("APP_ENV", "development")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()   # Supabase: Connect > Session pooler connection string
-FLW_PUBLIC = os.getenv("FLW_PUBLIC_KEY", "")
-FLW_SECRET = os.getenv("FLW_SECRET_KEY", "")
-FLW_HASH = os.getenv("FLW_WEBHOOK_HASH", "")
-# Optional: a price in whole US dollars for students outside Nigeria (set FLW_USD_AMOUNT=3). Unset = naira only, exactly as before.
-FLW_USD = billing.whole_dollars(os.getenv("FLW_USD_AMOUNT"))
+PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET_KEY", "").strip()   # the one key Paystack needs: sk_live_... (it also signs Paystack's webhooks)
 
 PRICE_NGN = 4000          # flat, non-negotiable, enforced server-side only
 ACCEPTED_PRICES = {PRICE_NGN, 3500}   # 3500 was the old price: a payment started just before the change can still be verified
+ACCEPTED_MINOR = {p * 100 for p in ACCEPTED_PRICES}   # the same prices in kobo, which is how Paystack counts
 CURRENCY = "NGN"
 
 # Lessons a signed-in student can read without paying: course id -> how many lessons from the start are free.
@@ -44,20 +42,6 @@ OTP_TTL, OTP_MAX_ATTEMPTS, RESEND_SECONDS = 600, 5, 60
 log = logging.getLogger("academy")
 logging.basicConfig(level=logging.INFO)
 
-# Stripe (the payment provider). Students pay on Stripe's own checkout page, so no card details ever reach this server.
-#   STRIPE_SECRET_KEY      sk_live_... (or sk_test_... while testing)
-#   STRIPE_WEBHOOK_SECRET  whsec_...   from the webhook you add in the Stripe Dashboard
-#   STRIPE_CURRENCY        ngn (default) or usd, gbp, eur...      STRIPE_AMOUNT  price in that currency (default 4000 for ngn)
-# Stripe stays OFF unless STRIPE_SECRET_KEY is set. Flutterwave is the main payment provider.
-STRIPE_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
-STRIPE_WHSEC = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
-STRIPE_CURRENCY = (os.getenv("STRIPE_CURRENCY", "ngn").strip() or "ngn").lower()
-try:
-    STRIPE_MINOR = billing.price_minor(os.getenv("STRIPE_AMOUNT") or (PRICE_NGN if STRIPE_CURRENCY == "ngn" else ""), STRIPE_CURRENCY)
-except ValueError:
-    STRIPE_MINOR = 0
-    if STRIPE_KEY:
-        log.error("Stripe is not usable: set STRIPE_CURRENCY to a supported currency, and STRIPE_AMOUNT (the price in that currency) unless it is ngn.")
 # The Control Room (live users, costs, sales) is for these accounts only: full email addresses, comma separated. Empty = nobody.
 OWNER_EMAILS = {e.strip().lower() for e in os.getenv("OWNER_EMAILS", "").split(",") if e.strip()}
 
@@ -95,7 +79,7 @@ CREATE TABLE IF NOT EXISTS otp_codes(
 CREATE TABLE IF NOT EXISTS payments(
   tx_ref TEXT PRIMARY KEY, uid TEXT NOT NULL, course_id TEXT NOT NULL,
   amount INTEGER NOT NULL, currency TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
-  flw_transaction_id TEXT UNIQUE, created_at TEXT NOT NULL, verified_at TEXT);
+  provider_txn_id TEXT UNIQUE, created_at TEXT NOT NULL, verified_at TEXT);
 """
 
 EXTRA_SCHEMA = """
@@ -182,14 +166,29 @@ CREATE TABLE IF NOT EXISTS purchase_requests(
   status TEXT NOT NULL, created_at TEXT NOT NULL, decided_at TEXT, UNIQUE(uid, course_id));
 """
 
-# Stripe payments and the owner's Control Room. Everything here only adds: old payments (Flutterwave) are kept exactly as they were.
+# Payment columns and the owner's Control Room. Existing payments are kept exactly as they were.
 OWNER_SCHEMA = """
+-- Payments made before Paystack was switched on went through Flutterwave: they keep that label and still count as sales.
 ALTER TABLE payments ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT 'flutterwave';
 ALTER TABLE payments ADD COLUMN IF NOT EXISTS amount_minor BIGINT;
-ALTER TABLE payments ADD COLUMN IF NOT EXISTS stripe_session_id TEXT;
-ALTER TABLE payments ADD COLUMN IF NOT EXISTS stripe_payment_intent TEXT;
-CREATE UNIQUE INDEX IF NOT EXISTS payments_stripe_session ON payments(stripe_session_id) WHERE stripe_session_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS payments_intent ON payments(stripe_payment_intent);
+-- The column that holds the payment company's own transaction number now has a neutral name (it works for any provider).
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'payments' AND column_name = 'flw_transaction_id')
+     AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'payments' AND column_name = 'provider_txn_id') THEN
+    ALTER TABLE payments RENAME COLUMN flw_transaction_id TO provider_txn_id;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'payments_flw_transaction_id_key' AND conrelid = 'payments'::regclass)
+     AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'payments_provider_txn_id_key' AND conrelid = 'payments'::regclass) THEN
+    ALTER TABLE payments RENAME CONSTRAINT payments_flw_transaction_id_key TO payments_provider_txn_id_key;
+  END IF;
+END $$;
+-- Clean-up of columns and a table from an earlier build of this update that nothing uses any more.
+DROP INDEX IF EXISTS payments_stripe_session;
+DROP INDEX IF EXISTS payments_intent;
+ALTER TABLE payments DROP COLUMN IF EXISTS stripe_session_id;
+ALTER TABLE payments DROP COLUMN IF EXISTS stripe_payment_intent;
+DROP TABLE IF EXISTS stripe_events;
 CREATE INDEX IF NOT EXISTS payments_verified ON payments(verified_at);
 -- Who is online right now (one row per signed-in student, or per visitor on the sign-in page), refreshed by a small heartbeat.
 CREATE TABLE IF NOT EXISTS presence(pid TEXT PRIMARY KEY, uid TEXT, name TEXT NOT NULL DEFAULT '', place TEXT NOT NULL DEFAULT '', seen_at BIGINT NOT NULL);
@@ -203,7 +202,7 @@ CREATE TABLE IF NOT EXISTS usage_log(
 CREATE INDEX IF NOT EXISTS usage_log_ts ON usage_log(ts);
 CREATE TABLE IF NOT EXISTS owner_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS owner_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS stripe_events(id TEXT PRIMARY KEY, type TEXT NOT NULL, received_at TEXT NOT NULL);
+DELETE FROM owner_meta WHERE key IN ('flw_error', 'flw_webhook');
 CREATE TABLE IF NOT EXISTS owner_audit(id BIGSERIAL PRIMARY KEY, ts TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL);
 """
 
@@ -213,7 +212,7 @@ TABLES = ("users", "courses", "enrollments", "otp_codes", "payments", "pending_s
           "class_groups", "class_group_courses", "class_group_members", "purchase_requests", "lesson_images", "image_blocks",
           "mentor_messages", "question_stats", "practice_sets", "xp_events", "board_optins", "prize_awards", "assignments",
           "assignment_attempts", "parent_contacts", "report_log", "talk_messages", "ai_usage", "talk_memory",
-          "presence", "active_days", "live_samples", "usage_log", "owner_settings", "owner_meta", "stripe_events", "owner_audit")
+          "presence", "active_days", "live_samples", "usage_log", "owner_settings", "owner_meta", "owner_audit")
 
 
 def now_iso():
@@ -437,7 +436,7 @@ def lesson_json(cid, i, title):
 def json_only_posts():
     # Cross-site forms can't send application/json without a CORS preflight, which blocks CSRF.
     # The webhook and the weekly-report trigger are called by other servers and are protected by their own secrets.
-    if request.method == "POST" and request.endpoint not in ("flutterwave_webhook", "stripe_webhook", "weekly_reports_run", "voice_transcribe") and not request.is_json:
+    if request.method == "POST" and request.endpoint not in ("paystack_webhook", "weekly_reports_run", "voice_transcribe") and not request.is_json:
         return err("Content-Type must be application/json.", 415)
 
 
@@ -727,36 +726,19 @@ def demo_pro():
     session["demo_pro"] = on
     return jsonify(ok=True, demo={"available": True, "on": on}, user=user_json(g.user))
 
-# ───────────────────────── Payments: Stripe (Flutterwave kept only as a fallback until Stripe is switched on) ─────────────────────────
+# ───────────────────────── Payments: Paystack ─────────────────────────
+# The student pays on Paystack's own page (cards, bank transfer, USSD) and comes back to this site. The server then asks Paystack
+# whether that reference was really paid, and only then unlocks the track. Paystack's webhook does the same if the student closes the page.
 
 
 def payment_provider():
-    """'flutterwave' while both its keys exist; 'stripe' only if the owner adds a Stripe key (it is off otherwise); otherwise None.
-    A public key without the secret key would take the student's money and then fail to confirm it, so that counts as not set up."""
-    if STRIPE_KEY and STRIPE_MINOR:
-        return "stripe"
-    return "flutterwave" if (FLW_PUBLIC and FLW_SECRET) else None
+    """'paystack' while its secret key is set, otherwise None. A public key (pk_...) cannot confirm payments, so it counts as not set up."""
+    return "paystack" if (PAYSTACK_SECRET and billing.paystack_key_mode(PAYSTACK_SECRET) != "public") else None
 
 
 def price_info():
     """What one track costs and who takes the payment. The browser only displays this; the server decides the price."""
-    p = payment_provider()
-    if p == "stripe":
-        return {"provider": p, "currency": STRIPE_CURRENCY.upper(), "amount": STRIPE_MINOR // 100 if STRIPE_MINOR % 100 == 0 else STRIPE_MINOR / 100,
-                "text": billing.money_text(STRIPE_MINOR, STRIPE_CURRENCY)}
-    info = {"provider": p, "currency": CURRENCY, "amount": PRICE_NGN, "text": billing.money_text(PRICE_NGN * 100, "ngn")}
-    if p == "flutterwave" and FLW_USD:   # lets a student abroad pay in dollars with an international card
-        info["usd"] = {"amount": FLW_USD, "text": billing.money_text(FLW_USD * 100, "usd")}
-    return info
-
-
-def checkout_base():
-    """The site's own address, using https when the app sits behind Render's proxy."""
-    env = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
-    if env:
-        return env
-    proto = (request.headers.get("X-Forwarded-Proto", "") or request.scheme).split(",")[0].strip() or "https"
-    return f"{proto}://{request.host}"
+    return {"provider": payment_provider(), "currency": CURRENCY, "amount": PRICE_NGN, "text": billing.money_text(PRICE_NGN * 100, "ngn")}
 
 
 def audit(actor, action, detail):
@@ -778,147 +760,72 @@ def notify_owner(subject, text):
     threading.Thread(target=run, daemon=True).start()
 
 
-def stripe_call(method, path, data=None, idem=None):
-    """One call to Stripe's API. Returns (http status, json body). Raises requests.RequestException if Stripe cannot be reached."""
-    headers = {"Stripe-Version": billing.API_VERSION}
-    if idem:
-        headers["Idempotency-Key"] = idem
-    r = requests.request(method, billing.API + path, data=data, auth=(STRIPE_KEY, ""), headers=headers, timeout=20)
+def note_pay_error(msg):
+    """Keep the last payment problem (paid but not confirmed, or Paystack refusing to start one) where the Control Room can show it."""
+    log.error("paystack payment problem: %s", msg)
+    try:
+        db().execute("INSERT INTO owner_meta(key,value) VALUES('paystack_error',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (f"{now_iso()} {msg}"[:400],))
+        db().commit()
+    except Exception:
+        log.exception("could not keep the paystack error")
+        db().rollback()
+
+
+def paystack_call(method, path, **kw):
+    """One request to Paystack's API. Returns its JSON answer ({} if it sent none). Network trouble raises requests.RequestException."""
+    r = requests.request(method, "https://api.paystack.co" + path, headers={"Authorization": f"Bearer {PAYSTACK_SECRET}"}, timeout=20, **kw)
     try:
         body = r.json() if r.content else {}
     except ValueError:
         body = {}
-    return r.status_code, body if isinstance(body, dict) else {}
+    return body if isinstance(body, dict) else {}
 
 
-def note_stripe_error(body, status):
-    """Keep the last checkout problem where the Control Room can show it, in Stripe's own words."""
-    msg = ((body or {}).get("error") or {}).get("message") or f"HTTP {status}"
-    log.error("stripe checkout failed: %s", msg)
-    try:
-        db().execute("INSERT INTO owner_meta(key,value) VALUES('stripe_error',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (f"{now_iso()} {msg}"[:400],))
-        db().commit()
-    except Exception:
-        log.exception("could not keep the stripe error")
-        db().rollback()
+def checkout_base():
+    """The site's own address (where Paystack sends the student back to), using https when the app sits behind Render's proxy."""
+    env = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
+    if env:
+        return env
+    proto = (request.headers.get("X-Forwarded-Proto", "") or request.scheme).split(",")[0].strip() or "https"
+    return f"{proto}://{request.host}"
 
 
-def note_flw_error(msg):
-    """Keep the last Flutterwave payment that was paid but could not be confirmed, where the Control Room can show it."""
-    log.error("flutterwave payment not confirmed: %s", msg)
-    try:
-        db().execute("INSERT INTO owner_meta(key,value) VALUES('flw_error',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (f"{now_iso()} {msg}"[:400],))
-        db().commit()
-    except Exception:
-        log.exception("could not keep the flutterwave error")
-        db().rollback()
-
-
-def stripe_apply(s):
-    """Act on a Stripe Checkout Session: unlock the track only when it is really paid. Safe to repeat.
-    Returns (state, why): 'paid', 'pending', 'failed', 'mismatch', 'closed' (already refunded or disputed) or 'unknown'."""
+def fulfil(tx_ref):
+    """Ask Paystack whether this reference was paid, then enroll. Idempotent. Returns (ok, message, http_status); 202 means 'still in progress'."""
     con = db()
-    ref = (s.get("client_reference_id") or (s.get("metadata") or {}).get("tx_ref")) if isinstance(s, dict) else None
-    pay = con.execute("SELECT * FROM payments WHERE tx_ref=? AND provider='stripe'", (ref,)).fetchone() if isinstance(ref, str) else None
-    if pay is None:
-        return "unknown", "unknown payment reference"
-    if pay["status"] in ("refunded", "disputed"):
-        return "closed", pay["status"]
-    state, why = billing.judge_session(s, pay)
-    if state == "paid":
-        pi = s.get("payment_intent")
-        pi = pi.get("id") if isinstance(pi, dict) else pi
-        with con.transaction():   # atomic: both writes happen or neither does
-            con.execute("UPDATE payments SET status='verified', stripe_session_id=COALESCE(stripe_session_id, ?), stripe_payment_intent=?, verified_at=? "
-                        "WHERE tx_ref=? AND status IN ('pending','failed')", (s.get("id"), pi if isinstance(pi, str) else None, now_iso(), pay["tx_ref"]))
-            con.execute("INSERT INTO enrollments(uid,course_id,created_at) VALUES(?,?,?) ON CONFLICT DO NOTHING", (pay["uid"], pay["course_id"], now_iso()))
-        con.commit()
-    elif state == "failed":
-        con.execute("UPDATE payments SET status='failed' WHERE tx_ref=? AND status='pending'", (pay["tx_ref"],))
-        con.commit()
-    elif state == "mismatch":
-        log.warning("stripe session rejected tx_ref=%s: %s", pay["tx_ref"], why)
-    return state, why
-
-
-def stripe_refunded(charge):
-    """A fully refunded charge closes the payment and takes the track back. A partial refund changes nothing."""
-    pi = charge.get("payment_intent")
-    if not isinstance(pi, str) or charge.get("refunded") is not True:
-        return
-    con = db()
-    pay = con.execute("SELECT * FROM payments WHERE stripe_payment_intent=? AND provider='stripe'", (pi,)).fetchone()
-    if pay is None or pay["status"] != "verified":
-        return
-    with con.transaction():
-        con.execute("UPDATE payments SET status='refunded' WHERE tx_ref=?", (pay["tx_ref"],))
-        con.execute("DELETE FROM enrollments WHERE uid=? AND course_id=?", (pay["uid"], pay["course_id"]))
-        audit("stripe", "refund", f"{pay['tx_ref']} {pay['course_id']}")
-    con.commit()
-
-
-def stripe_disputed(dispute):
-    """A customer disputed a payment with their bank: flag it and tell the owner. Access stays until the dispute is decided."""
-    pi = dispute.get("payment_intent")
-    con = db()
-    pay = con.execute("SELECT * FROM payments WHERE stripe_payment_intent=? AND provider='stripe'", (pi,)).fetchone() if isinstance(pi, str) else None
-    if pay is None:
-        return
-    if pay["status"] == "verified":
-        con.execute("UPDATE payments SET status='disputed' WHERE tx_ref=?", (pay["tx_ref"],))
-    audit("stripe", "dispute", f"{pay['tx_ref']} {pay['course_id']}")
-    con.commit()
-    notify_owner("A payment was disputed", f"A student disputed a payment with their bank ({pay['course_id']}, reference {pay['tx_ref']}).\n\nOpen the Stripe Dashboard, then Payments, then Disputes, to answer it before the deadline.")
-
-
-def flw_verify(transaction_id):
-    r = requests.get(f"https://api.flutterwave.com/v3/transactions/{transaction_id}/verify",
-                     headers={"Authorization": f"Bearer {FLW_SECRET}"}, timeout=20)
-    return r.json() if r.content else {}
-
-
-def fulfil(tx_ref, transaction_id):
-    """Verify with Flutterwave, then enroll. Idempotent. Returns (ok, message, http_status)."""
-    con = db()
-    pay = con.execute("SELECT * FROM payments WHERE tx_ref=? AND provider='flutterwave'", (tx_ref,)).fetchone()   # a row is only ever verified by its own provider
+    pay = con.execute("SELECT * FROM payments WHERE tx_ref=? AND provider='paystack'", (tx_ref,)).fetchone()   # a row is only ever verified by its own provider
     if pay is None:
         return False, "Unknown payment reference.", 404
     if pay["status"] == "verified":
         return True, "Already verified.", 200
-    try:
-        body = flw_verify(transaction_id)
-    except requests.RequestException:
-        log.exception("flutterwave verify failed")
-        return False, "Could not reach the payment provider. Try again in a moment.", 502
-    body = body if isinstance(body, dict) else {}
-    d = body.get("data") if isinstance(body.get("data"), dict) else {}
+    if pay["status"] != "pending":
+        return False, "This payment is closed.", 409
     owner = con.execute("SELECT email FROM users WHERE uid=?", (pay["uid"],)).fetchone()
-    cur = pay["currency"]
+    release_db()   # Paystack can take a few seconds: do not hold a database connection while waiting
     try:
-        paid = float(d.get("amount") or 0)
-    except (TypeError, ValueError):
-        paid = 0.0
-    checks = (   # (what is wrong if this fails, did it pass). The price must be one this app really sells, in naira or in the optional dollar price.
-        ("it is not marked successful", body.get("status") == "success" and d.get("status") == "successful"),
-        ("the reference does not match", d.get("tx_ref") == tx_ref),
-        ("the currency does not match", d.get("currency") == cur),
-        ("the price is not one this app sells", (cur == CURRENCY and pay["amount"] in ACCEPTED_PRICES) or (cur == "USD" and bool(FLW_USD) and pay["amount"] == FLW_USD)),
-        ("the amount paid is too low", paid >= pay["amount"]),
-        ("the email on the payment is not the student's", owner is not None and str((d.get("customer") or {}).get("email", "")).lower() == owner["email"]),
-    )
-    if not all(ok for _, ok in checks):
-        log.warning("payment rejected tx_ref=%s flw_status=%s", tx_ref, d.get("status"))
-        if d.get("status") == "successful":   # money moved but we said no: the owner needs to see it (a plain failed card attempt is not worth a note)
-            note_flw_error(f"Reference {tx_ref} was paid but not confirmed because " + "; ".join(why for why, ok in checks if not ok) + ".")
+        body = paystack_call("GET", "/transaction/verify/" + quote(tx_ref, safe=""))
+    except requests.RequestException:
+        log.exception("paystack verify failed")
+        return False, "Could not reach the payment provider. Try again in a moment.", 502
+    charged = pay["amount_minor"] or pay["amount"] * 100
+    state, problems = billing.judge_verification(body, tx_ref, pay["currency"], charged, ACCEPTED_MINOR, owner["email"] if owner else "")
+    if state == "waiting":
+        return False, "Your payment is still being confirmed.", 202
+    if state == "mismatch":   # money moved but we said no: the owner needs to see it (a plain failed card attempt is not worth a note)
+        note_pay_error(f"Reference {tx_ref} was paid but not confirmed because " + "; ".join(problems) + ".")
+    if state != "paid":
+        log.warning("payment not confirmed tx_ref=%s state=%s", tx_ref, state)
         return False, "Payment could not be verified.", 402
+    txn = str(body["data"].get("id") or "") or None
+    con = db()
     try:
         with con.transaction():   # atomic: both writes happen or neither does
-            con.execute("UPDATE payments SET status='verified', flw_transaction_id=?, verified_at=? "
-                        "WHERE tx_ref=? AND status='pending'", (str(d["id"]), now_iso(), tx_ref))
+            con.execute("UPDATE payments SET status='verified', provider_txn_id=?, verified_at=? "
+                        "WHERE tx_ref=? AND status='pending'", (txn, now_iso(), tx_ref))
             con.execute("INSERT INTO enrollments(uid,course_id,created_at) VALUES(?,?,?) ON CONFLICT DO NOTHING",
                         (pay["uid"], pay["course_id"], now_iso()))
         con.commit()
-    except psycopg.errors.IntegrityError:   # this Flutterwave transaction already paid for another reference
+    except psycopg.errors.IntegrityError:   # this Paystack transaction already paid for another reference
         con.rollback()
         return False, "This transaction was already used.", 409
     return True, "Verified.", 200
@@ -936,142 +843,72 @@ def payment_init():
     gate = purchase_access(g.user["uid"], cid)
     if gate["state"] != "open":
         return err(GATE_MESSAGES.get(gate["state"], "You cannot buy this class right now."), 403)
-    provider, uid = payment_provider(), g.user["uid"]
-    if provider is None:
+    uid, email = g.user["uid"], g.user["email"]
+    if payment_provider() is None:
         return err("Payments are not configured yet.", 503)
     since = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
     if db().execute("SELECT COUNT(*) AS n FROM payments WHERE uid=? AND created_at>?", (uid, since)).fetchone()["n"] >= 10:
         return err("Too many payment attempts in a short time. Please wait a little and try again.", 429)
     tx_ref = f"OATS-{uuid.uuid4().hex}"   # unique per attempt
-    if provider == "flutterwave":
-        amount, cur = PRICE_NGN, CURRENCY
-        if body.get("currency") == "USD":   # a student outside Nigeria chose the dollar price
-            if not FLW_USD:
-                return err("Dollar payments are not available.", 400)
-            amount, cur = FLW_USD, "USD"
-        db().execute("INSERT INTO payments(tx_ref,uid,course_id,amount,currency,amount_minor,created_at) VALUES(?,?,?,?,?,?,?)",
-                     (tx_ref, uid, cid, amount, cur, amount * 100, now_iso()))
-        db().commit()
-        return jsonify(provider="flutterwave", txRef=tx_ref, amount=amount, currency=cur, publicKey=FLW_PUBLIC,
-                       email=g.user["email"], courseId=cid)
-    title = db().execute("SELECT title FROM courses WHERE id=?", (cid,)).fetchone()["title"]
-    db().execute("INSERT INTO payments(tx_ref,uid,course_id,amount,currency,provider,amount_minor,created_at) VALUES(?,?,?,?,?,'stripe',?,?)",
-                 (tx_ref, uid, cid, math.ceil(STRIPE_MINOR / 100), STRIPE_CURRENCY.upper(), STRIPE_MINOR, now_iso()))
+    db().execute("INSERT INTO payments(tx_ref,uid,course_id,amount,currency,amount_minor,provider,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                 (tx_ref, uid, cid, PRICE_NGN, CURRENCY, PRICE_NGN * 100, "paystack", now_iso()))
     db().commit()
     base = checkout_base()
-    form = billing.checkout_form(tx_ref=tx_ref, uid=uid, course_id=cid, course_title=title, email=g.user["email"], currency=STRIPE_CURRENCY,
-                                 amount_minor=STRIPE_MINOR, success_url=f"{base}/?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
-                                 cancel_url=f"{base}/?checkout=cancel")
-    release_db()   # never hold a database connection while waiting on Stripe
-
-    def give_up(message, status=502):
-        db().execute("UPDATE payments SET status='failed' WHERE tx_ref=? AND status='pending'", (tx_ref,))
-        db().commit()
-        return err(message, status)
-    try:
-        status, body = stripe_call("POST", "/checkout/sessions", data=form, idem=tx_ref)
+    release_db()   # waiting on Paystack
+    try:   # the amount is in kobo and comes from this server, never from the browser
+        answer = paystack_call("POST", "/transaction/initialize", json={"email": email, "amount": PRICE_NGN * 100, "currency": CURRENCY,
+                                                                         "reference": tx_ref, "callback_url": base + "/"})
     except requests.RequestException:
-        log.exception("stripe could not be reached")
-        return give_up("Could not reach the payment provider. Try again in a moment.")
-    if status != 200 or not str(body.get("id", "")).startswith("cs_") or not str(body.get("url", "")).startswith("https://"):
-        note_stripe_error(body, status)
-        return give_up("Checkout could not be opened. Please try again in a moment.")
-    db().execute("UPDATE payments SET stripe_session_id=? WHERE tx_ref=?", (body["id"], tx_ref))
-    db().commit()
-    return jsonify(provider="stripe", url=body["url"], txRef=tx_ref, courseId=cid)
+        log.exception("paystack initialize failed")
+        answer = None
+    url = billing.initialize_url(answer)
+    if not url:
+        db().execute("DELETE FROM payments WHERE tx_ref=? AND status='pending'", (tx_ref,))   # nothing was started, so it should not count as an attempt
+        db().commit()
+        if isinstance(answer, dict) and answer.get("message"):   # Paystack answered and said no (a wrong key, for example): the owner must know
+            note_pay_error(f"Paystack would not start a payment: {str(answer['message'])[:200]}. Check PAYSTACK_SECRET_KEY on Render.")
+        return err("Could not start the payment. Please try again in a moment.", 502)
+    return jsonify(provider="paystack", txRef=tx_ref, url=url, courseId=cid)
 
 
 @app.post("/api/payments/verify")
 @login_required
 def payment_verify():
     body = request.get_json(silent=True) or {}
-    if "sessionId" in body:   # Stripe: the student came back from the checkout page
-        sid = body.get("sessionId")
-        if not isinstance(sid, str) or not re.fullmatch(r"cs_[A-Za-z0-9_]{8,200}", sid):
-            return err("sessionId is required.")
-        pay = db().execute("SELECT * FROM payments WHERE stripe_session_id=? AND provider='stripe'", (sid,)).fetchone()
-        if pay is None or pay["uid"] != g.user["uid"]:
-            return err("Unknown payment reference.", 404)
-        if pay["status"] in ("refunded", "disputed"):
-            return err("This payment was refunded or disputed.", 409)
-        if pay["status"] != "verified":
-            release_db()
-            try:
-                status, s = stripe_call("GET", f"/checkout/sessions/{sid}")
-            except requests.RequestException:
-                log.exception("stripe verify failed")
-                return err("Could not reach the payment provider. Try again in a moment.", 502)
-            if status != 200:
-                return err("Payment could not be verified.", 402)
-            state, why = stripe_apply(s)
-            if state == "pending":
-                return jsonify(pending=True, message="Your payment is still being confirmed."), 202
-            if state != "paid":
-                return err("This payment did not go through." if state == "failed" else "Payment could not be verified.", 402)
-        return jsonify(ok=True, courseId=pay["course_id"], user=user_json(g.user))
-    tx_ref, tid = body.get("txRef"), body.get("transactionId")   # Flutterwave
-    if not isinstance(tx_ref, str) or not re.fullmatch(r"\d{1,20}", str(tid or "")):
-        return err("txRef and transactionId are required.")
-    pay = db().execute("SELECT uid FROM payments WHERE tx_ref=?", (tx_ref,)).fetchone()
+    tx_ref = body.get("txRef")
+    if not isinstance(tx_ref, str) or not re.fullmatch(r"OATS-[0-9a-f]{32}", tx_ref):
+        return err("txRef is required.")
+    pay = db().execute("SELECT uid, course_id FROM payments WHERE tx_ref=?", (tx_ref,)).fetchone()
     if pay is None or pay["uid"] != g.user["uid"]:
         return err("Unknown payment reference.", 404)
-    ok, msg, status = fulfil(tx_ref, str(tid))
+    ok, msg, status = fulfil(tx_ref)
+    if status == 202:   # the bank is still confirming: the page asks again in a few seconds
+        return jsonify(ok=False, pending=True, message=msg), 202
     if not ok:
         return err(msg, status)
-    return jsonify(ok=True, user=user_json(g.user))
+    return jsonify(ok=True, courseId=pay["course_id"], user=user_json(g.user))
 
 
-@app.post("/api/stripe/webhook")
-def stripe_webhook():
-    """Stripe reports payments here, signed with STRIPE_WEBHOOK_SECRET. This is what unlocks a bank transfer that clears after the
-    student has already left the page, and what closes a payment that gets refunded."""
+@app.post("/api/paystack/webhook")
+def paystack_webhook():
+    """Safety net if the browser closes mid-payment. Paystack > Settings > API Keys & Webhooks > Live Webhook URL. Paystack signs every call
+    with your secret key, so no extra password is needed."""
     raw = request.get_data()
-    if not billing.verify_signature(STRIPE_WHSEC, request.headers.get("Stripe-Signature", ""), raw):
-        return "", 400
-    try:
-        ev = json.loads(raw)
-    except ValueError:
-        return "", 400
-    if not isinstance(ev, dict):
-        return "", 400
-    etype, obj = str(ev.get("type", "")), (ev.get("data") or {}).get("object")
-    obj = obj if isinstance(obj, dict) else {}
-    try:
-        db().execute("INSERT INTO stripe_events(id,type,received_at) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET received_at=excluded.received_at",
-                     (str(ev.get("id", ""))[:80], etype[:80], now_iso()))
-        db().commit()
-        if etype in ("checkout.session.completed", "checkout.session.async_payment_succeeded", "checkout.session.expired"):
-            state, why = stripe_apply(obj)
-            log.info("stripe %s -> %s %s", etype, state, why)
-        elif etype == "checkout.session.async_payment_failed":
-            db().execute("UPDATE payments SET status='failed' WHERE tx_ref=? AND provider='stripe' AND status='pending'", (str(obj.get("client_reference_id")),))
-            db().commit()
-        elif etype == "charge.refunded":
-            stripe_refunded(obj)
-        elif etype == "charge.dispute.created":
-            stripe_disputed(obj)
-    except Exception:
-        log.exception("stripe webhook failed: %s", etype)
-        db().rollback()
-        return "", 500   # Stripe will try again
-    return "", 200
-
-
-@app.post("/api/flutterwave/webhook")
-def flutterwave_webhook():
-    """Safety net if the browser closes mid-payment. Set the URL and the secret hash in Flutterwave > Settings > Webhooks."""
-    sent = request.headers.get("verif-hash", "")
-    if not FLW_HASH or not hmac.compare_digest(sent, FLW_HASH):
+    if not billing.signature_ok(raw, request.headers.get("x-paystack-signature", ""), PAYSTACK_SECRET):
         return "", 401
-    try:   # remember that Flutterwave reached us, so the Control Room's setup check can say so
-        db().execute("INSERT INTO owner_meta(key,value) VALUES('flw_webhook',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (now_iso(),))
+    try:   # remember that Paystack reached us, so the Control Room's setup check can say so
+        db().execute("INSERT INTO owner_meta(key,value) VALUES('paystack_webhook',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (now_iso(),))
         db().commit()
     except Exception:
-        log.exception("could not note the flutterwave webhook")
+        log.exception("could not note the paystack webhook")
         db().rollback()
-    d = (request.get_json(silent=True) or {}).get("data") or {}
-    if d.get("tx_ref") and d.get("id"):
-        fulfil(d["tx_ref"], str(d["id"]))
+    try:
+        event = json.loads(raw)
+    except ValueError:
+        event = {}
+    data = event.get("data") if isinstance(event, dict) and isinstance(event.get("data"), dict) else {}
+    if isinstance(event, dict) and event.get("event") == "charge.success" and isinstance(data.get("reference"), str):
+        fulfil(data["reference"])   # never trusts the webhook's own numbers: it asks Paystack again
     return "", 200
 
 # ───────────────────────── Progress, quizzes, CA record, exams, certificates ─────────────────────────
@@ -2979,7 +2816,6 @@ def housekeep():
                 old = lambda days: (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
                 con.execute("DELETE FROM live_samples WHERE ts<?", (now - 35 * 86400,))
                 con.execute("DELETE FROM usage_log WHERE ts<?", (old(100),))
-                con.execute("DELETE FROM stripe_events WHERE received_at<?", (old(60),))
                 con.commit()
             if claim("alerts", now, 900):
                 check_alerts()
@@ -3103,7 +2939,7 @@ def collect_meters(s):
     money_in = [p for p in month_pays if p["status"] in ("verified", "disputed")]
     rev_usd = sum(v for v in (usd_of(p) for p in money_in) if v is not None)
     other = sorted({p["currency"].upper() for p in money_in if usd_of(p) is None})
-    fees_usd = sum(control.payment_fee_usd(p["provider"], p["currency"], usd_of(p), s) for p in money_in if usd_of(p) is not None)
+    fees_usd = sum(control.paystack_fee_usd(usd_of(p), s) for p in money_in if usd_of(p) is not None)
     by_day = {}
     for p in pays:
         if p["status"] in ("verified", "disputed") and usd_of(p) is not None:
@@ -3120,27 +2956,18 @@ def collect_meters(s):
     # Server and payments
     peak7 = con.execute("SELECT COALESCE(MAX(n),0) AS v FROM live_samples WHERE ts>=?", (now - 7 * 86400,)).fetchone()["v"]
     provider = payment_provider()
-    meta = {r["key"]: r["value"] for r in con.execute("SELECT key, value FROM owner_meta WHERE key IN ('stripe_error','flw_error','flw_webhook')")}
-    ev = con.execute("SELECT COUNT(*) AS n, MAX(received_at) AS last FROM stripe_events").fetchone()
-    stripe_sales = con.execute("SELECT COUNT(*) AS n FROM payments WHERE provider='stripe' AND status='verified'").fetchone()["n"]
-    flw_sales = con.execute("SELECT COUNT(*) AS n FROM payments WHERE provider='flutterwave' AND status='verified'").fetchone()["n"]
-    if provider == "stripe":
-        seen_hook, last_hook, last_err = bool(ev["n"]), ev["last"], meta.get("stripe_error", "")
-    else:
-        seen_hook, last_hook, last_err = "flw_webhook" in meta, meta.get("flw_webhook"), meta.get("flw_error", "")
-    pm, sm = billing.flw_key_mode(FLW_PUBLIC), billing.flw_key_mode(FLW_SECRET)
-    modes = {m for m in (pm, sm) if m}
-    flw_mode = "mixed" if len(modes) > 1 else (next(iter(modes)) if modes else "")
-    pay = {"provider": provider, "mode": billing.key_mode(STRIPE_KEY) if provider == "stripe" else flw_mode, "webhookSeen": seen_hook, "lastWebhook": last_hook,
-           "lastError": last_err, "stripeSales": stripe_sales, "flwSales": flw_sales, "price": price_info()["text"],
-           "usdPrice": (price_info().get("usd") or {}).get("text", "")}
-    flw_recent = ""   # a rejected payment only worries the owner for 3 days
-    if provider == "flutterwave" and last_err:
+    meta = {r["key"]: r["value"] for r in con.execute("SELECT key, value FROM owner_meta WHERE key IN ('paystack_error','paystack_webhook')")}
+    pay_sales = con.execute("SELECT COUNT(*) AS n FROM payments WHERE status='verified'").fetchone()["n"]
+    seen_hook, last_hook, last_err = "paystack_webhook" in meta, meta.get("paystack_webhook"), meta.get("paystack_error", "")
+    pay = {"provider": provider, "mode": billing.paystack_key_mode(PAYSTACK_SECRET), "webhookSeen": seen_hook, "lastWebhook": last_hook,
+           "lastError": last_err, "sales": pay_sales, "price": price_info()["text"]}
+    pay_recent = ""   # a payment problem only worries the owner for 3 days
+    if last_err:
         try:
             if datetime.fromisoformat(last_err.split(" ", 1)[0]) >= datetime.now(timezone.utc) - timedelta(days=3):
-                flw_recent = last_err.split(" ", 1)[1] if " " in last_err else last_err
+                pay_recent = last_err.split(" ", 1)[1] if " " in last_err else last_err
         except ValueError:
-            flw_recent = ""
+            pay_recent = ""
 
     # Money, in dollars
     flat = s["render_usd"] + s["supabase_usd"] + s["resend_usd"]
@@ -3158,9 +2985,8 @@ def collect_meters(s):
     seen = {"openai": {"mtd": o_mtd, "projected": o_proj, "on": openai["on"]}, "resend": {"month": r_month, "day": r_day, "on": resend["on"]},
             "supabase": {"db_bytes": sz["total"], "images_bytes": sz["images"], "images_n": images_n},
             "render": {"peak_live": int(peak7), "paid_students": buyers},
-            "stripe": {"provider": provider, "mode": pay["mode"], "webhook_seen": pay["webhookSeen"], "stripe_sales": stripe_sales, "production": ENV == "production"},
-            "flw": {"mode": flw_mode, "webhook_hash": bool(FLW_HASH), "webhook_seen": pay["webhookSeen"], "sales": flw_sales, "recent_error": flw_recent,
-                    "production": ENV == "production"},
+            "paystack": {"ready": provider is not None, "mode": pay["mode"], "webhook_seen": pay["webhookSeen"], "sales": pay_sales, "recent_error": pay_recent,
+                         "production": ENV == "production"},
             "money": {"cost_projected": cost_proj, "revenue_projected": rev_proj, "day_of_month": w["dayOfMonth"]}}
     return data, seen
 
@@ -3174,26 +3000,18 @@ def setup_check(pay):
     add("Owner account", "ok" if OWNER_EMAILS else "bad", "" if OWNER_EMAILS else "Set OWNER_EMAILS on Render.")
     add("Running as a live site", "ok" if ENV == "production" else "warn", "" if ENV == "production" else "Set APP_ENV=production on Render.")
     add("Testing shortcut is off", "ok" if not os.getenv("DEMO_UNLOCK") else "warn", "" if not os.getenv("DEMO_UNLOCK") else "Remove DEMO_UNLOCK from Render. It must never be on for real students.")
-    if pay["provider"] == "stripe":
-        add(f"Stripe key ({pay['mode'] or 'unknown'} mode)", "ok" if pay["mode"] == "live" or ENV != "production" else "bad",
-            "" if pay["mode"] == "live" or ENV != "production" else "This is a test key. Anyone can pay with Stripe's test card and get a track free.")
-        add("Stripe webhook secret", "ok" if STRIPE_WHSEC else "warn", "" if STRIPE_WHSEC else "Add STRIPE_WEBHOOK_SECRET (starts with whsec_).")
-        add("Stripe webhook heard from Stripe", "ok" if pay["webhookSeen"] else "warn", "" if pay["webhookSeen"] else "Nothing received yet. In Stripe, add the endpoint and send a test event.")
-    elif STRIPE_KEY:
-        add("Stripe key", "bad", "A Stripe key is set but STRIPE_AMOUNT (or STRIPE_CURRENCY) is wrong, so Stripe is off. Remove STRIPE_SECRET_KEY from Render if you only use Flutterwave.")
-    elif not (FLW_PUBLIC and FLW_SECRET):
-        add("Flutterwave keys", "bad", "Both FLW_PUBLIC_KEY and FLW_SECRET_KEY are needed on Render (Flutterwave > Settings > API keys). Until then nobody can pay.")
+    if not PAYSTACK_SECRET:
+        add("Paystack key", "bad", "PAYSTACK_SECRET_KEY is needed on Render (Paystack > Settings > API Keys & Webhooks, the Secret Key). Until then nobody can pay.")
     else:
-        mode, live_ok = pay["mode"], pay["mode"] == "live" or ENV != "production"
-        if mode == "mixed":
-            add("Flutterwave keys", "bad", "One key is a test key and the other is live. Copy both from the same mode.")
+        mode = pay["mode"]
+        if mode == "public":
+            add("Paystack key", "bad", "That is your PUBLIC key (it starts with pk_). The app needs the SECRET key that starts with sk_live_.")
         elif mode in ("live", "test"):
-            add(f"Flutterwave keys ({mode} mode)", "ok" if live_ok else "bad", "" if live_ok else "These are test keys. Anyone can pay with Flutterwave's test card and get a track free. Use your live keys.")
+            live_ok = mode == "live" or ENV != "production"
+            add(f"Paystack key ({mode} mode)", "ok" if live_ok else "bad", "" if live_ok else "This is a test key. Real cards will not work and no money reaches you. Use your live secret key (sk_live_...).")
         else:
-            add("Flutterwave keys", "warn", "These do not look like Flutterwave keys (they start with FLWPUBK and FLWSECK).")
-        add("Flutterwave webhook secret hash", "ok" if FLW_HASH else "warn", "" if FLW_HASH else "Add FLW_WEBHOOK_HASH on Render: the same secret hash you typed in Flutterwave > Settings > Webhooks.")
-        add("Flutterwave webhook heard", "ok" if pay["webhookSeen"] else "warn", "" if pay["webhookSeen"] else "Nothing received yet. The web address to give Flutterwave is your site address followed by /api/flutterwave/webhook.")
-        add("Dollar price for students abroad", "ok" if FLW_USD else "warn", f"On: {pay['usdPrice']} for international cards." if FLW_USD else "Optional. Add FLW_USD_AMOUNT (for example 3) on Render to let students outside Nigeria pay in dollars.")
+            add("Paystack key", "warn", "This does not look like a Paystack secret key (it should start with sk_live_).")
+        add("Paystack webhook heard", "ok" if pay["webhookSeen"] else "warn", "" if pay["webhookSeen"] else "Nothing received yet. In Paystack > Settings > API Keys & Webhooks, put your site address followed by /api/paystack/webhook in the Live Webhook URL box.")
     add("OpenAI key", "ok" if os.getenv("OPENAI_API_KEY") else "warn", "" if os.getenv("OPENAI_API_KEY") else "Air Omega, pictures and voice are off.")
     add("Email sending (Resend)", "ok" if resend_ready() else "bad", "" if resend_ready() else "Set RESEND_API_KEY and RESEND_FROM. Students cannot get sign-in codes without them.")
     return items
@@ -3251,11 +3069,9 @@ def owner_whatif():
     s = owner_settings()
     students = int(_clamp(d.get("students"), 0, 1_000_000, 100))
     buy = _clamp(d.get("buyPct"), 0, 100, 10) / 100
-    info = price_info()
-    cur = STRIPE_CURRENCY if info["provider"] == "stripe" else "ngn"
-    price = control.to_usd(STRIPE_MINOR if info["provider"] == "stripe" else PRICE_NGN * 100, cur, s["usd_ngn"])
+    price = control.to_usd(PRICE_NGN * 100, "ngn", s["usd_ngn"])
     price = _clamp(d.get("priceUsd"), 0.1, 10000, price if price is not None else 2.7)
-    res = control.whatif(students, per_from_db(), s, price, buy, provider=info["provider"] or "flutterwave", currency=cur)
+    res = control.whatif(students, per_from_db(), s, price, buy)
     res["priceUsd"] = round(price, 2)
     return jsonify(res)
 
