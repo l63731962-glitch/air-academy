@@ -446,6 +446,8 @@ def secure_headers(resp):
     resp.headers["Referrer-Policy"] = "same-origin"
     if request.path.startswith("/api/"):
         resp.headers["Cache-Control"] = "no-store"
+    elif request.path.startswith("/static/intro.") and request.path.endswith((".mp4", ".webm")):   # the welcome video is the biggest file the app sends: phones keep it for a week (intro.js adds ?v=N to replace it)
+        resp.headers["Cache-Control"] = "public, max-age=604800"
     return resp
 
 # ───────────────────────── Passwordless auth (email OTP) ─────────────────────────
