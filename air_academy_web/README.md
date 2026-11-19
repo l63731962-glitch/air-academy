@@ -71,6 +71,9 @@ Running it twice is safe: an email is never sent twice for the same week. It nee
 **Refunds** are made in the Paystack dashboard. The app does not take a track back automatically on a refund.
 **Older payments.** Payments made before Paystack was switched on keep their original label and still count as sales in the Control Room.
 
+## Welcome video
+`static/intro.js` (loaded in `<head>` of `index.html`) plays `static/intro.mp4` full screen the moment the app opens, then pops up an **EXPLORE** button; tapping it opens the app. It starts muted when the browser forbids sound (with a "Tap for sound" button), has a Skip button from the first second, and plays once per session (`SHOW` at the top of the file: `session`, `day` or `always`). It steps aside by itself when the video is missing or broken, has not started after 7 seconds, on Data Saver or 2G, with reduced motion, on `/?nointro`, off the front page, and when a student returns from Paystack (`?reference=` / `?trxref=`). The video is served with a one-week cache header; after replacing `intro.mp4`, add 1 to `VERSION` in `intro.js`. The service worker does not touch video files. Use H.264 + AAC, about 2 MB or less, about 10 seconds or less (`-movflags +faststart`); a vertical 9:16 video fills phone screens best.
+
 ## Live users and the Control Room (owner only)
 Set `OWNER_EMAILS` to your email. Sign in with it and the dashboard shows a green **N live · Control Room** button.
 - **Live users.** Every open tab sends a tiny ping every 30 seconds. Someone counts as online for 75 seconds after their last ping, so one person is one, two people are two, and a student with three tabs open is still one. A tab that is hidden, or a phone that was put down, drops off within about a minute. Signed-in students and visitors on the sign-in page are counted separately. You are not counted unless you tap "Count me too" (handy for testing: or open a private window without signing in).
