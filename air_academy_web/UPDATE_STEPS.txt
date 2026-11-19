@@ -1,7 +1,9 @@
-AIR ACADEMY: PAYSTACK + LIVE USERS + CONTROL ROOM UPDATE
-========================================================
+AIR ACADEMY: PAYSTACK + WELCOME VIDEO + LIVE USERS + CONTROL ROOM UPDATE
+=====================================================================
 
 WHAT YOU GET
+- A WELCOME VIDEO plays full screen the moment the app opens. When it ends, an EXPLORE button pops
+  up and the student taps it to continue (see "WELCOME VIDEO" below).
 - Payments run on PAYSTACK only. Flutterwave and Stripe are gone from the app.
 - Paystack needs ONE key on Render. No webhook password, no public key.
 - A student taps Unlock, pays on Paystack's secure page (card, bank transfer or USSD), comes back
@@ -18,9 +20,9 @@ WHAT YOU GET
 
 STEP 1. COPY THE FILES (PowerShell, inside the folder that has app.py)
 
-    Expand-Archive -Path "$HOME\Downloads\air_academy_paystack_control_room.zip" -DestinationPath . -Force
+    Expand-Archive -Path "$HOME\Downloads\air_academy_paystack_intro_video.zip" -DestinationPath . -Force
 
-This adds billing.py, control.py, static/live.js, static/owner.js and replaces app.py, omega.py,
+This adds billing.py, control.py, static/intro.js, static/intro.mp4, static/live.js, static/owner.js and replaces app.py, omega.py,
 README.md and the static files. It does not touch your .env, your database or your lesson files.
 (Use THIS zip, not the earlier ones. It contains everything.)
 
@@ -68,7 +70,7 @@ B. Students outside Nigeria: Settings > Preferences, find the international paym
 STEP 4. PUSH
 
     git add .
-    git commit -m "Paystack payments, live users and Control Room"
+    git commit -m "Paystack payments, welcome video and Control Room"
     git push
 
 Render rebuilds. Sign in with your Gmail: you will see the green Control Room button.
@@ -91,6 +93,36 @@ PAYSTACK FEES (so there are no surprises)
 Paystack keeps about 1.5% plus N100 from a local card payment. On a N4,000 course that is about
 N160, so you receive about N3,840. Foreign cards cost more (about 3.9% plus N100). The Control Room
 estimates these and you can correct the rates under Plans. Your Paystack dashboard shows the exact fee.
+
+WELCOME VIDEO
+What a student sees: the video starts by itself the moment the app opens, full screen. When it ends,
+an EXPLORE button pops up; tapping it opens the app. There is a "Skip" button from the first second.
+- Sound: phones and browsers do not let sound start by itself in most cases, so the video usually
+  plays silent with a "Tap for sound" button. (In the installed app it may start with sound.)
+- It plays once each time the app is opened, not on every page. To change that, edit SHOW at the top
+  of static/intro.js ("session", "day" or "always").
+- It steps aside by itself (the student goes straight to the app) when the video is missing or cannot
+  play, when it has not started after 7 seconds (slow data), when Data Saver or a 2G connection is on,
+  when the phone is set to reduce motion, and when a student comes back from paying.
+- To look at the app without the video, open your site with /?nointro at the end of the address.
+- It is about 0.9 MB. Phones keep it for a week, so it is downloaded once.
+
+TO REPLACE THE VIDEO LATER
+1. Make the new file H.264 video with AAC sound, about 2 MB or less and 10 seconds or less, and name
+   it intro.mp4. Put it in the static folder, replacing the old one.
+2. Open static/intro.js and add 1 to the number after "var VERSION =". This makes phones that already
+   saved the old video download the new one.
+3. Push as in STEP 4.
+A VERTICAL (9:16) video fills a phone screen. A wide video (like the current one) shows as a wide band
+across the middle of a phone, with dark space above and below. That still looks fine, but a vertical
+version of the same video would look bigger on phones.
+If your new video is too big, this PowerShell command makes a small copy (needs ffmpeg installed):
+    ffmpeg -i mynewvideo.mp4 -vf "scale=-2:720" -c:v libx264 -crf 28 -preset slow -c:a aac -b:a 96k -movflags +faststart intro.mp4
+
+ABOUT THE PIXVERSE MARK
+The current intro.mp4 has PixVerse's free-plan watermark in its top-right corner. PixVerse offers
+watermark-free export on its paid plans, and a paid course app should use a clean copy. When you have
+one, replace the file as described above. Nothing else needs to change.
 
 HOW THE LIVE COUNT WORKS
 Every open tab pings the server every 30 seconds. Someone counts for 75 seconds after their last
