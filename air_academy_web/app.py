@@ -7,7 +7,7 @@ from urllib.parse import quote
 import psycopg
 import requests
 from dotenv import load_dotenv
-from flask import Flask, Response, g, has_request_context, jsonify, request, send_from_directory, session
+from flask import Flask, Response, g, has_request_context, jsonify, redirect, request, send_from_directory, session
 from markupsafe import escape
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -17,6 +17,7 @@ from course_content import CONTENT, KINDS, RUBRIC, STEPS
 from courses_seed import COURSES, LESSONS, NOTES
 import billing
 import control
+import legal
 import omega
 
 load_dotenv()
@@ -190,6 +191,9 @@ ALTER TABLE payments DROP COLUMN IF EXISTS stripe_session_id;
 ALTER TABLE payments DROP COLUMN IF EXISTS stripe_payment_intent;
 DROP TABLE IF EXISTS stripe_events;
 CREATE INDEX IF NOT EXISTS payments_verified ON payments(verified_at);
+-- When the person ticked the box that agrees to the Terms and Privacy Policy (kept as proof of consent).
+ALTER TABLE users ADD COLUMN IF NOT EXISTS terms_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE pending_signups ADD COLUMN IF NOT EXISTS terms_at TEXT NOT NULL DEFAULT '';
 -- Who is online right now (one row per signed-in student, or per visitor on the sign-in page), refreshed by a small heartbeat.
 CREATE TABLE IF NOT EXISTS presence(pid TEXT PRIMARY KEY, uid TEXT, name TEXT NOT NULL DEFAULT '', place TEXT NOT NULL DEFAULT '', seen_at BIGINT NOT NULL);
 CREATE INDEX IF NOT EXISTS presence_seen ON presence(seen_at);
@@ -577,16 +581,18 @@ def register():
         return err("Check your date of birth.")
     if b.get("gender") not in GENDERS:
         return err("Choose a gender option.")
+    if b.get("agreed") is not True:
+        return err("Tick the box to agree to the Terms and the Privacy Policy.")
     if password_problem(pw):
         return err(password_problem(pw))
     u = db().execute("SELECT pw_hash FROM users WHERE email=?", (email,)).fetchone()
     if u and u["pw_hash"]:
         return err("An account with this email already exists. Sign in instead.", 409)
     # Details wait here until the email code proves the address is theirs; only then do they touch a real account.
-    db().execute("INSERT INTO pending_signups(email,full_name,dob,gender,pw_hash,created_at) VALUES(?,?,?,?,?,?) "
+    db().execute("INSERT INTO pending_signups(email,full_name,dob,gender,pw_hash,created_at,terms_at) VALUES(?,?,?,?,?,?,?) "
                  "ON CONFLICT(email) DO UPDATE SET full_name=excluded.full_name, dob=excluded.dob, gender=excluded.gender, "
-                 "pw_hash=excluded.pw_hash, created_at=excluded.created_at",
-                 (email, name, dob.isoformat(), b["gender"], generate_password_hash(pw), now_iso()))
+                 "pw_hash=excluded.pw_hash, created_at=excluded.created_at, terms_at=excluded.terms_at",
+                 (email, name, dob.isoformat(), b["gender"], generate_password_hash(pw), now_iso(), now_iso()))
     db().commit()
     return request_code()
 
@@ -603,11 +609,11 @@ def verify_code():
         return bad
     u = db().execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
     if u is None:
-        db().execute("INSERT INTO users(uid,email,created_at,full_name,dob,gender,pw_hash) VALUES(?,?,?,?,?,?,?)",
-                     (uuid.uuid4().hex, email, now_iso(), p["full_name"], p["dob"], p["gender"], p["pw_hash"]))
+        db().execute("INSERT INTO users(uid,email,created_at,full_name,dob,gender,pw_hash,terms_at) VALUES(?,?,?,?,?,?,?,?)",
+                     (uuid.uuid4().hex, email, now_iso(), p["full_name"], p["dob"], p["gender"], p["pw_hash"], p["terms_at"]))
     else:   # an older passwordless account keeps its courses and gains a profile and password
-        db().execute("UPDATE users SET full_name=?, dob=?, gender=?, pw_hash=? WHERE uid=?",
-                     (p["full_name"], p["dob"], p["gender"], p["pw_hash"], u["uid"]))
+        db().execute("UPDATE users SET full_name=?, dob=?, gender=?, pw_hash=?, terms_at=? WHERE uid=?",
+                     (p["full_name"], p["dob"], p["gender"], p["pw_hash"], p["terms_at"], u["uid"]))
     db().execute("DELETE FROM pending_signups WHERE email=?", (email,))
     db().commit()
     return start_session(db().execute("SELECT * FROM users WHERE email=?", (email,)).fetchone())
@@ -2686,7 +2692,44 @@ def admin_remove(token, uid):
 @app.get("/join/<code>")
 @app.get("/admin/<token>")
 def index(**_):
-    return send_from_directory("static", "index.html")
+    """The app's single page, with the business footer written into it on the server so a reviewer (or any crawler that does not run
+    scripts) sees the business name, contact details and the policy links on the home page."""
+    try:
+        with open(os.path.join(app.static_folder, "index.html"), encoding="utf-8") as fh:
+            raw = fh.read()
+    except OSError:
+        return send_from_directory("static", "index.html")
+    resp = Response(raw.replace("<!--SITE_FOOTER-->", legal.footer_html(legal.business(), {"price": billing.money_text(PRICE_NGN * 100, "ngn")})), mimetype="text/html")
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+# ───────────────────────── Legal pages (Paystack, Visa and Mastercard want these on the website) ─────────────────────────
+def legal_context():
+    """The facts the policies quote, taken from the app itself so a policy can never disagree with the real price or the real free lessons."""
+    ids = {c["id"]: c["title"] for c in COURSES}
+    free = [f"the first {n} lesson{'' if n == 1 else 's'} of {ids[cid]}" for cid, n in FREE_LESSONS.items() if n and cid in ids]
+    try:
+        titles = [r["title"] for r in db().execute('SELECT title FROM courses ORDER BY title COLLATE "C"')]
+    except Exception:
+        log.exception("legal pages: course list unavailable")
+        titles = sorted(ids.values())
+    return {"price": billing.money_text(PRICE_NGN * 100, "ngn"), "courses": titles, "free": " and ".join(free)}
+
+
+def _legal_view(slug):
+    def view():
+        resp = Response(legal.page_html(slug, legal.business(), legal_context(), checkout_base()), mimetype="text/html")
+        resp.headers["Cache-Control"] = "public, max-age=300"
+        return resp
+    view.__name__ = "legal_" + slug.replace("-", "_")
+    return view
+
+
+for _slug, _path, _title, _desc in legal.PAGES:
+    app.add_url_rule(_path, view_func=_legal_view(_slug), strict_slashes=False)
+for _old, _new in legal.ALIASES.items():   # other addresses a reviewer might type
+    app.add_url_rule(_old, endpoint="legal_alias_" + _old.strip("/").replace("-", "_"), view_func=(lambda target=_new: redirect(target, 301)), strict_slashes=False)
 
 
 # ───────────────────────── Live users and the owner's Control Room ─────────────────────────
@@ -2818,6 +2861,8 @@ def housekeep():
                 old = lambda days: (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
                 con.execute("DELETE FROM live_samples WHERE ts<?", (now - 35 * 86400,))
                 con.execute("DELETE FROM usage_log WHERE ts<?", (old(100),))
+                con.execute("DELETE FROM pending_signups WHERE created_at<?", (old(1),))   # sign-up details nobody confirmed by email (the privacy policy says 24 hours)
+                con.execute("DELETE FROM otp_codes WHERE expires_at<?", (now - 3600,))
                 con.commit()
             if claim("alerts", now, 900):
                 check_alerts()
@@ -3014,6 +3059,8 @@ def setup_check(pay):
         else:
             add("Paystack key", "warn", "This does not look like a Paystack secret key (it should start with sk_live_).")
         add("Paystack webhook heard", "ok" if pay["webhookSeen"] else "warn", "" if pay["webhookSeen"] else "Nothing received yet. In Paystack > Settings > API Keys & Webhooks, put your site address followed by /api/paystack/webhook in the Live Webhook URL box.")
+    state, hint = legal.contact_state(legal.business(), OWNER_EMAILS)
+    add("Support email on the policy pages", "warn" if state == "bad" and ENV != "production" else state, hint)
     add("OpenAI key", "ok" if os.getenv("OPENAI_API_KEY") else "warn", "" if os.getenv("OPENAI_API_KEY") else "Air Omega, pictures and voice are off.")
     add("Email sending (Resend)", "ok" if resend_ready() else "bad", "" if resend_ready() else "Set RESEND_API_KEY and RESEND_FROM. Students cannot get sign-in codes without them.")
     return items
