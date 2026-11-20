@@ -20,6 +20,7 @@ Open http://127.0.0.1:5000
 - Webhook (safety net so a payment unlocks even if the student closes the page right after paying): Paystack > Settings > API Keys & Webhooks > **Live Webhook URL** = `https://YOUR-DOMAIN/api/paystack/webhook`. Nothing to add on Render for it.
 - `PUBLIC_URL` (optional): your site's address, for example `https://YOUR-SITE.onrender.com`. Paystack sends students back here after paying. When it is not set the app uses the address the student is visiting, which is correct on Render.
 - `OWNER_EMAILS`: your own email address (comma-separated if more than one). Only these accounts see the live-user counter and the Control Room. It is read on the server, so no one else can open it. Keep your address here on Render, not in the code.
+- `SUPPORT_EMAIL`: the public support address shown in the footer and on the policy pages (make one for the app; do not reuse your own sign-in email). Optional: `SUPPORT_PHONE`, `BUSINESS_LOCATION` (town or city only), `BUSINESS_ADDRESS` (shown only if set), `BUSINESS_REG_NO`, `BUSINESS_NAME` (default `Open Air Tech Space`). No personal name is needed anywhere.
 - `SMTP_*`: your email provider. Leave `SMTP_HOST` empty in development and the 6-digit code prints in the terminal instead.
 - `FREE_ACCESS_EMAILS`: optional, comma-separated full email addresses that get every course free (enrolled automatically at sign-in, including courses added later).
 - `OPENAI_API_KEY`: powers every AI feature (project generator, Air Omega, picture maker). `OPENAI_MODEL` (default `gpt-4o-mini`) is the model for Air Omega's chat, practice questions, assignments and marking.
@@ -71,6 +72,9 @@ Running it twice is safe: an email is never sent twice for the same week. It nee
 **Refunds** are made in the Paystack dashboard. The app does not take a track back automatically on a refund.
 **Older payments.** Payments made before Paystack was switched on keep their original label and still count as sales in the Control Room.
 
+## Policy pages and footer
+`/terms`, `/refund-policy`, `/delivery-policy`, `/privacy-policy` are written by `legal.py` and styled by `static/legal.css`. The footer (business name, "Based in Nigeria", support email, policy links) is written into the home page on the server, so crawlers and reviewers see it without running scripts. The price, free lessons and course list come from the app itself, so the pages cannot drift. Every number a policy promises (refund days, reply time, ...) is a constant at the top of `legal.py`; change `UPDATED` there when the wording changes. Sign-up needs the agreement box and stores the time in `users.terms_at`. Unconfirmed sign-up details are deleted after 24 hours. The Control Room set-up check shows whether `SUPPORT_EMAIL` is set.
+
 ## Welcome video
 `static/intro.js` (loaded in `<head>` of `index.html`) plays `static/intro.mp4` full screen the moment the app opens, then pops up an **EXPLORE** button; tapping it opens the app. It starts muted when the browser forbids sound (with a "Tap for sound" button), has a Skip button from the first second, and plays once per session (`SHOW` at the top of the file: `session`, `day` or `always`). It steps aside by itself when the video is missing or broken, has not started after 7 seconds, on Data Saver or 2G, with reduced motion, on `/?nointro`, off the front page, and when a student returns from Paystack (`?reference=` / `?trxref=`). The video is served with a one-week cache header; after replacing `intro.mp4`, add 1 to `VERSION` in `intro.js`. The service worker does not touch video files. Use H.264 + AAC, about 2 MB or less, about 10 seconds or less (`-movflags +faststart`); a vertical 9:16 video fills phone screens best.
 
@@ -93,6 +97,7 @@ On Render: **Root Directory** `air_academy_web`, build command `pip install -r r
 ## Files
 - `app.py`: API, OTP auth, payments (Paystack), live users, owner routes, database schema
 - `billing.py`: small payment helpers with no database in them (price text, Paystack key mode, webhook signature check, what a payment confirmation must match)
+- `legal.py` and `static/legal.css`: the four policy pages and the business footer (no database in it; details come from Render settings)
 - `control.py`: the Control Room's maths with no database in it (price lists, plans, projections, warnings, what-if)
 - `static/live.js` (the ping) and `static/owner.js` (the Control Room, loaded only for the owner)
 - `assistant.js`: Air Omega everywhere: the floating panel, quick commands, the actions it can run, and the memory panel
