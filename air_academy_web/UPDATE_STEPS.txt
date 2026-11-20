@@ -1,7 +1,13 @@
-AIR ACADEMY: PAYSTACK + WELCOME VIDEO + LIVE USERS + CONTROL ROOM UPDATE
-=====================================================================
+AIR ACADEMY: PAYSTACK + POLICY PAGES + WELCOME VIDEO + LIVE USERS + CONTROL ROOM UPDATE
+=======================================================================================
 
 WHAT YOU GET
+- THE POLICY PAGES that Paystack and Visa/Mastercard check before they approve card payments:
+  Terms of Service (/terms), Refund Policy (/refund-policy), Delivery Policy (/delivery-policy) and
+  Privacy Policy (/privacy-policy), plus a business footer at the bottom of every page, including the
+  home page. Your own name and street address are NOT shown anywhere (see "THE POLICY PAGES" below).
+- A tick box at sign-up ("I agree to the Terms and Privacy Policy") and a short agreement line with links
+  under every Unlock button.
 - A WELCOME VIDEO plays full screen the moment the app opens. When it ends, an EXPLORE button pops
   up and the student taps it to continue (see "WELCOME VIDEO" below).
 - Payments run on PAYSTACK only. Flutterwave and Stripe are gone from the app.
@@ -20,9 +26,9 @@ WHAT YOU GET
 
 STEP 1. COPY THE FILES (PowerShell, inside the folder that has app.py)
 
-    Expand-Archive -Path "$HOME\Downloads\air_academy_paystack_intro_video.zip" -DestinationPath . -Force
+    Expand-Archive -Path "$HOME\Downloads\air_academy_paystack_legal_pages.zip" -DestinationPath . -Force
 
-This adds billing.py, control.py, static/intro.js, static/intro.mp4, static/live.js, static/owner.js and replaces app.py, omega.py,
+This adds billing.py, control.py, legal.py, static/legal.css, static/intro.js, static/intro.mp4, static/live.js, static/owner.js and replaces app.py, omega.py,
 README.md and the static files. It does not touch your .env, your database or your lesson files.
 (Use THIS zip, not the earlier ones. It contains everything.)
 
@@ -30,6 +36,14 @@ STEP 2. RENDER SETTINGS (Dashboard > your service > Environment)
 
     OWNER_EMAILS       = your-own-gmail-address@gmail.com   (the Gmail you sign in with)
     PAYSTACK_SECRET_KEY = sk_live_...
+    SUPPORT_EMAIL      = a-new-support-address@gmail.com     (NEW, needed: see "THE POLICY PAGES")
+
+Optional, only if you want them shown on the website (leave them out to keep them private):
+    SUPPORT_PHONE      = a phone number for customers
+    BUSINESS_LOCATION  = a town or city only, for example Lagos (without it the site says "Based in Nigeria")
+    BUSINESS_ADDRESS   = a street address (not shown unless you set this)
+    BUSINESS_REG_NO    = your CAC registration number, if you have one
+    BUSINESS_NAME      = only if the public name should be different from "Open Air Tech Space"
 
 Type your real address in OWNER_EMAILS on Render only. It is deliberately not in the code or in
 this file, because your code is on public GitHub.
@@ -75,6 +89,13 @@ STEP 4. PUSH
 
 Render rebuilds. Sign in with your Gmail: you will see the green Control Room button.
 
+STEP 4B. LOOK AT THE POLICY PAGES
+Open these on your live site and read each one once (your site address, then the ending):
+    /terms     /refund-policy     /delivery-policy     /privacy-policy
+Scroll to the bottom of the home page: you should see "Open Air Tech Space", "Based in Nigeria", your support
+email and the four policy links. In the Control Room > Setup check, "Support email on the policy pages"
+should be green.
+
 STEP 5. TEST ONE REAL PAYMENT
 Sign up with a second email (a spare Gmail), open a locked course, tap Unlock and pay N4,000 with
 your own card or by bank transfer. The course should open by itself. This is the only way to be
@@ -88,6 +109,37 @@ Then open Plans and tell it what you really pay (Render plan, Supabase plan, Res
 OpenAI you are willing to spend, naira per dollar, Paystack fee). Pick a plan from each list or
 type your own numbers, then Save. Until you do, it uses free-plan defaults and the warnings will
 not match your real bill. Press "Send a test alert" and confirm the email reaches you (check spam).
+
+THE POLICY PAGES (for Paystack and the card companies)
+Why they exist: before Paystack turns on live card payments, they and the card companies (Visa, Mastercard)
+look at your website for: your business name, a way for customers to contact you, the price and what is sold,
+a refund policy, a delivery policy, a privacy policy and terms. All of that is now on your site.
+
+Your privacy: the pages show only "Open Air Tech Space", "Based in Nigeria" and the support email you set.
+Your name and street address are not in the app, the code or this zip. Visa and Mastercard ask for a business
+name and ONE way to contact you (email, phone or address), not all three.
+- Make a NEW free email for the app (for example openairtechspace.support@gmail.com) and put it in
+  SUPPORT_EMAIL. Do not use the Gmail you sign in with: it is shown to everybody, and the Control Room
+  turns yellow if you do.
+- Your real name and address still go in Paystack's own business form (Settings > Business / Go Live). That
+  form is private and only Paystack sees it. Use the same details as your registration documents.
+- If a reviewer ever asks for an address on the site, set BUSINESS_ADDRESS on Render and it appears at once.
+
+Promises the policies make (change the numbers at the top of legal.py if you want different ones, then push):
+    refund for a change of mind: 7 days after payment, if no final exam taken and no certificate yet
+    we answer emails within 2 business days; a refund is started within 3 business days of approval
+    a course that did not open is fixed within 1 business day, or refunded
+    data requests (see, fix or delete data) answered within 30 days
+    30 days' notice before a paid course is ever withdrawn
+ONLY KEEP PROMISES YOU WILL REALLY KEEP. Also change UPDATED at the top of legal.py to the new date.
+
+Things the app does not do by itself, that the policies describe as done by request (by email):
+- Refunds: you press refund in the Paystack dashboard. The student's access to that course is not closed
+  automatically yet. If you want that automated, ask me.
+- Deleting an account: there is no delete button yet. You do it on request.
+
+These pages are a solid, honest starting point written for how your app really works. They are not legal
+advice. Before you rely on them, have a Nigerian lawyer read them once.
 
 PAYSTACK FEES (so there are no surprises)
 Paystack keeps about 1.5% plus N100 from a local card payment. On a N4,000 course that is about
