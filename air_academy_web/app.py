@@ -274,21 +274,45 @@ class Conn:
 
 
 def init_db():
-    # A short-lived direct connection (not the pool), so importing this module never starts pool threads before a fork.
-    with psycopg.connect(_dsn(), prepare_threshold=None) as con:   # commits when the block ends cleanly, then closes
-        # Several workers boot at once. The lock makes them take turns creating tables (it frees itself at commit).
-        con.execute("SELECT pg_advisory_xact_lock(727401)")
-        for script in (SCHEMA, EXTRA_SCHEMA, GROUP_SCHEMA, OWNER_SCHEMA):
-            con.execute(script)
-        for t in TABLES:
-            con.execute(f"ALTER TABLE {t} ENABLE ROW LEVEL SECURITY")
-        for c in COURSES:
-            con.execute(
-                """INSERT INTO courses(id,title,description,lessons_count) VALUES(%s,%s,%s,%s)
-                   ON CONFLICT(id) DO UPDATE SET title=excluded.title, description=excluded.description,
-                   lessons_count=excluded.lessons_count""",
-                (c["id"], c["title"], c["description"], len(c["lessons"])),
-            )
+    """Create or update the tables. Safe to run on every start, and safe while an older copy of the site is still running.
+
+    Changing a table takes a strong lock on it. If the old copy of the site is busy writing to the same tables at that moment, the
+    two can wait on each other (a "deadlock"). So this (1) does the table changes only when the schema text has changed, (2) gives up
+    on a lock after a few seconds instead of waiting forever, and (3) tries again when Postgres picked this side as the loser.
+    """
+    sig = hashlib.sha256(("\n".join((SCHEMA, EXTRA_SCHEMA, GROUP_SCHEMA, OWNER_SCHEMA)) + "|" + ",".join(TABLES)).encode()).hexdigest()[:16]
+    for attempt in range(8):
+        try:
+            # A short-lived direct connection (not the pool), so importing this module never starts pool threads before a fork.
+            with psycopg.connect(_dsn(), prepare_threshold=None) as con:   # commits when the block ends cleanly, then closes
+                con.execute("SET LOCAL lock_timeout = '8s'")   # never wait for ever on a lock held by someone else
+                # Several workers boot at once. The lock makes them take turns (it frees itself at commit).
+                con.execute("SELECT pg_advisory_xact_lock(727401)")
+                have_meta = con.execute("SELECT to_regclass('owner_meta')").fetchone()[0]
+                done = con.execute("SELECT value FROM owner_meta WHERE key = 'schema_sig'").fetchone() if have_meta else None
+                if not (done and done[0] == sig):   # first start, or the schema text changed: do the table changes
+                    for script in (SCHEMA, EXTRA_SCHEMA, GROUP_SCHEMA, OWNER_SCHEMA):
+                        con.execute(script)
+                    secured = {r[0] for r in con.execute(
+                        "SELECT relname FROM pg_class WHERE relkind = 'r' AND relrowsecurity AND relnamespace = current_schema()::regnamespace")}
+                    for t in TABLES:
+                        if t not in secured:   # only tables that still need it, so the strong lock is taken as rarely as possible
+                            con.execute(f"ALTER TABLE {t} ENABLE ROW LEVEL SECURITY")
+                    con.execute("INSERT INTO owner_meta(key,value) VALUES('schema_sig',%s) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (sig,))
+                for c in COURSES:
+                    con.execute(
+                        """INSERT INTO courses(id,title,description,lessons_count) VALUES(%s,%s,%s,%s)
+                           ON CONFLICT(id) DO UPDATE SET title=excluded.title, description=excluded.description,
+                           lessons_count=excluded.lessons_count""",
+                        (c["id"], c["title"], c["description"], len(c["lessons"])),
+                    )
+            return
+        except (psycopg.errors.DeadlockDetected, psycopg.errors.LockNotAvailable) as e:
+            if attempt == 7:
+                raise
+            wait = 2 + attempt * 2
+            log.warning("init_db: %s. Trying again in %s seconds (attempt %s of 8)", type(e).__name__, wait, attempt + 2)
+            time.sleep(wait)
 
 
 def db():
