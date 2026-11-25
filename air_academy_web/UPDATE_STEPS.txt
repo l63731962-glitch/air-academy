@@ -1,0 +1,238 @@
+AIR ACADEMY: FULL COURSES (158 NEW LESSONS) + PAYSTACK + POLICY PAGES + WELCOME VIDEO + CONTROL ROOM UPDATE
+==============================================================================================
+
+WHAT YOU GET
+- FULL COURSES. Every course is now a full course: the eight main tracks grow from 8 to 24 lessons
+  (6 modules each) and the three animation tracks (2D, 3D, AI Animation) grow from 5 to 15 lessons
+  (3 modules each). That is 158 new lessons, each with a story-style explanation, a diagram, key terms,
+  common mistakes, a 4-question quiz and an activity. Python is a separate course and is not touched.
+- NOTHING OF YOUR STUDENTS MOVES. Old lessons keep their numbers, so progress, quiz scores, assignments and
+  certificates stay exactly as they are. New lessons are slotted in between the old ones by module (see
+  "FULL COURSES" below). The first two Prompt Engineering lessons stay free; everything else costs N4,000 per course.
+- The exam grows with the course (10, 15 or 20 questions). CA stays 40% and the exam 60%.
+- THE POLICY PAGES that Paystack and Visa/Mastercard check before they approve card payments:
+  Terms of Service (/terms), Refund Policy (/refund-policy), Delivery Policy (/delivery-policy) and
+  Privacy Policy (/privacy-policy), plus a business footer at the bottom of every page, including the
+  home page. Your own name and street address are NOT shown anywhere (see "THE POLICY PAGES" below).
+- A tick box at sign-up ("I agree to the Terms and Privacy Policy") and a short agreement line with links
+  under every Unlock button.
+- A WELCOME VIDEO plays full screen the moment the app opens. When it ends, an EXPLORE button pops
+  up and the student taps it to continue (see "WELCOME VIDEO" below).
+- Payments run on PAYSTACK only. Flutterwave and Stripe are gone from the app.
+- Paystack needs ONE key on Render. No webhook password, no public key.
+- A student taps Unlock, pays on Paystack's secure page (card, bank transfer or USSD), comes back
+  to your site, and the course opens by itself.
+- A green "N live - Control Room" button on YOUR dashboard only. It shows how many people are
+  using the app right now (one person = 1, two = 2, and so on), refreshed every few seconds.
+- The Control Room (only your email can open it): live users, an OpenAI/Resend/Supabase/Render
+  cost meter with warnings and email alerts, this month's bill with Paystack's fees counted,
+  a "what if I had 1,000 students" slider, sales, sign-ups, a launch checklist, and a tool to give
+  a student a track.
+- It warns you (red) if a Paystack TEST key is left on your live site.
+- Your students' accounts, courses and payments are NOT touched. Old payments stay counted as
+  sales. New tables are added by themselves when the app starts.
+
+STEP 1. COPY THE FILES (PowerShell, inside the folder that has app.py)
+
+    Expand-Archive -Path "$HOME\Downloads\air_academy_full_courses.zip" -DestinationPath . -Force
+
+This adds course_plan.py, diagrams.py, check_lessons.py, every lessons_*_more.py file, billing.py, control.py, legal.py, static/legal.css, static/intro.js, static/intro.mp4, static/live.js, static/owner.js and replaces app.py, omega.py,
+README.md and the static files. It does not touch your .env, your database or your lesson files.
+(Use THIS zip, not the earlier ones. It contains everything.)
+
+STEP 2. RENDER SETTINGS (Dashboard > your service > Environment)
+
+    OWNER_EMAILS       = your-own-gmail-address@gmail.com   (the Gmail you sign in with)
+    PAYSTACK_SECRET_KEY = sk_live_...
+    SUPPORT_EMAIL      = a-new-support-address@gmail.com     (NEW, needed: see "THE POLICY PAGES")
+
+Optional, only if you want them shown on the website (leave them out to keep them private):
+    SUPPORT_PHONE      = a phone number for customers
+    BUSINESS_LOCATION  = a town or city only, for example Lagos (without it the site says "Based in Nigeria")
+    BUSINESS_ADDRESS   = a street address (not shown unless you set this)
+    BUSINESS_REG_NO    = your CAC registration number, if you have one
+    BUSINESS_NAME      = only if the public name should be different from "Open Air Tech Space"
+
+Type your real address in OWNER_EMAILS on Render only. It is deliberately not in the code or in
+this file, because your code is on public GitHub.
+
+Where the Paystack key is: Paystack dashboard > Settings > API Keys & Webhooks. Copy the
+SECRET key (it starts with sk_live_). Do NOT use the public key (starts with pk_live_): it cannot
+confirm payments, and the Control Room will tell you if you paste it by mistake.
+Never send the secret key to anybody, not even to me.
+
+Delete these from Render if they exist (the app no longer reads them):
+    FLW_PUBLIC_KEY, FLW_SECRET_KEY, FLW_WEBHOOK_HASH, FLW_USD_AMOUNT, and anything starting STRIPE_
+
+Also check:
+  - APP_ENV=production
+  - DEMO_UNLOCK must NOT exist
+
+Settings > Start Command (so one slow OpenAI answer does not freeze everybody else). Your repository
+has a folder called air_academy_web, so the command is:
+
+    gunicorn --chdir air_academy_web app:app --workers 2 --threads 4 --timeout 120
+
+STEP 3. PAYSTACK DASHBOARD (two small things)
+
+A. Webhook (so a payment unlocks even if the student closes the page right after paying):
+   Settings > API Keys & Webhooks > "Live Webhook URL", paste:
+
+       https://YOUR-SITE.onrender.com/api/paystack/webhook
+
+   Save. (Use your real Render address in place of YOUR-SITE.onrender.com.)
+
+B. Students outside Nigeria: Settings > Preferences, find the international payments option and
+   request it. Paystack reviews it, usually within a couple of working days. After it is approved,
+   a student abroad pays the same N4,000 with their own card and their bank converts the money.
+   Until it is approved, foreign cards are declined. Nothing is needed in the app for this.
+   (A separate dollar price is not part of this update. It would need a US dollar account with
+   Paystack's partner bank.)
+
+STEP 4. PUSH
+
+    git add .
+    git commit -m "Paystack payments, welcome video and Control Room"
+    git push
+
+Render rebuilds. Sign in with your Gmail: you will see the green Control Room button.
+
+STEP 4B. LOOK AT THE POLICY PAGES
+Open these on your live site and read each one once (your site address, then the ending):
+    /terms     /refund-policy     /delivery-policy     /privacy-policy
+Scroll to the bottom of the home page: you should see "Open Air Tech Space", "Based in Nigeria", your support
+email and the four policy links. In the Control Room > Setup check, "Support email on the policy pages"
+should be green.
+
+STEP 5. TEST ONE REAL PAYMENT
+Sign up with a second email (a spare Gmail), open a locked course, tap Unlock and pay N4,000 with
+your own card or by bank transfer. The course should open by itself. This is the only way to be
+sure everything is connected, so please do it before you announce anything. Paystack pays the
+money out to your bank on its normal schedule, minus its fee.
+
+STEP 6. OPEN THE CONTROL ROOM > SETUP CHECK, THEN PLANS
+Setup check should show green ticks for "Paystack key (live mode)" and, after the first real
+payment, "Paystack webhook heard". A red cross means act now; read its note.
+Then open Plans and tell it what you really pay (Render plan, Supabase plan, Resend plan, how much
+OpenAI you are willing to spend, naira per dollar, Paystack fee). Pick a plan from each list or
+type your own numbers, then Save. Until you do, it uses free-plan defaults and the warnings will
+not match your real bill. Press "Send a test alert" and confirm the email reaches you (check spam).
+
+FULL COURSES (how the 158 new lessons fit in)
+- Where every lesson sits, and the module headings, are in ONE file: course_plan.py. Open a course there to see
+  its 6 (or 3) modules and the order of the lessons. A plain number is an old lesson; a piece of text is a new one.
+- The new lessons are in the lessons_<course>_more.py files. The old lessons are still in lessons_<course>.py.
+- A lesson that has no page yet shows "Coming soon" and cannot be opened. The totals, CA and exam count only
+  lessons that have a page. All 158 pages are included in this zip, so every lesson is open now.
+- After the update, open a course and look at it once: you should see module headings (for example
+  "Foundations", "Core techniques") and 24 lessons (15 in the animation tracks). Open one new lesson in each
+  course and read it. I wrote them in plain, simple language; you know your students best, so change anything
+  you want to say in your own voice.
+- Please check the facts that change over time before you promote: prices, free-plan limits and button names of
+  outside tools (cloud providers, app stores, AI video and music tools, Godot, Blender and so on). The lessons say
+  "check the current terms and prices" where it matters, but websites change.
+- The AI Animation lessons discuss copyright, consent and credits in general terms. They are education, not
+  legal advice. Have a Nigerian lawyer look at the copyright and data-protection parts if you will lean on them.
+- To add or change a lesson later, edit its lessons_<course>_more.py file, then check it (PowerShell):
+
+      python check_lessons.py lessons_web_more 24 9
+
+  (course file name, the last lesson number, the first lesson number: 24 and 9 for the eight main tracks;
+  15 and 6 for 2d_animation, 3d_animation and ai_animation). The checker tells you exactly what to fix.
+
+THE POLICY PAGES (for Paystack and the card companies)
+Why they exist: before Paystack turns on live card payments, they and the card companies (Visa, Mastercard)
+look at your website for: your business name, a way for customers to contact you, the price and what is sold,
+a refund policy, a delivery policy, a privacy policy and terms. All of that is now on your site.
+
+Your privacy: the pages show only "Open Air Tech Space", "Based in Nigeria" and the support email you set.
+Your name and street address are not in the app, the code or this zip. Visa and Mastercard ask for a business
+name and ONE way to contact you (email, phone or address), not all three.
+- Make a NEW free email for the app (for example openairtechspace.support@gmail.com) and put it in
+  SUPPORT_EMAIL. Do not use the Gmail you sign in with: it is shown to everybody, and the Control Room
+  turns yellow if you do.
+- Your real name and address still go in Paystack's own business form (Settings > Business / Go Live). That
+  form is private and only Paystack sees it. Use the same details as your registration documents.
+- If a reviewer ever asks for an address on the site, set BUSINESS_ADDRESS on Render and it appears at once.
+
+Promises the policies make (change the numbers at the top of legal.py if you want different ones, then push):
+    refund for a change of mind: 7 days after payment, if no final exam taken and no certificate yet
+    we answer emails within 2 business days; a refund is started within 3 business days of approval
+    a course that did not open is fixed within 1 business day, or refunded
+    data requests (see, fix or delete data) answered within 30 days
+    30 days' notice before a paid course is ever withdrawn
+ONLY KEEP PROMISES YOU WILL REALLY KEEP. Also change UPDATED at the top of legal.py to the new date.
+
+Things the app does not do by itself, that the policies describe as done by request (by email):
+- Refunds: you press refund in the Paystack dashboard. The student's access to that course is not closed
+  automatically yet. If you want that automated, ask me.
+- Deleting an account: there is no delete button yet. You do it on request.
+
+These pages are a solid, honest starting point written for how your app really works. They are not legal
+advice. Before you rely on them, have a Nigerian lawyer read them once.
+
+PAYSTACK FEES (so there are no surprises)
+Paystack keeps about 1.5% plus N100 from a local card payment. On a N4,000 course that is about
+N160, so you receive about N3,840. Foreign cards cost more (about 3.9% plus N100). The Control Room
+estimates these and you can correct the rates under Plans. Your Paystack dashboard shows the exact fee.
+
+WELCOME VIDEO
+What a student sees: the video starts by itself the moment the app opens, full screen. When it ends,
+an EXPLORE button pops up; tapping it opens the app. There is a "Skip" button from the first second.
+- Sound: phones and browsers do not let sound start by itself in most cases, so the video usually
+  plays silent with a "Tap for sound" button. (In the installed app it may start with sound.)
+- It plays once each time the app is opened, not on every page. To change that, edit SHOW at the top
+  of static/intro.js ("session", "day" or "always").
+- It steps aside by itself (the student goes straight to the app) when the video is missing or cannot
+  play, when it has not started after 7 seconds (slow data), when Data Saver or a 2G connection is on,
+  when the phone is set to reduce motion, and when a student comes back from paying.
+- To look at the app without the video, open your site with /?nointro at the end of the address.
+- It is about 0.9 MB. Phones keep it for a week, so it is downloaded once.
+
+TO REPLACE THE VIDEO LATER
+1. Make the new file H.264 video with AAC sound, about 2 MB or less and 10 seconds or less, and name
+   it intro.mp4. Put it in the static folder, replacing the old one.
+2. Open static/intro.js and add 1 to the number after "var VERSION =". This makes phones that already
+   saved the old video download the new one.
+3. Push as in STEP 4.
+A VERTICAL (9:16) video fills a phone screen. A wide video (like the current one) shows as a wide band
+across the middle of a phone, with dark space above and below. That still looks fine, but a vertical
+version of the same video would look bigger on phones.
+If your new video is too big, this PowerShell command makes a small copy (needs ffmpeg installed):
+    ffmpeg -i mynewvideo.mp4 -vf "scale=-2:720" -c:v libx264 -crf 28 -preset slow -c:a aac -b:a 96k -movflags +faststart intro.mp4
+
+ABOUT THE PIXVERSE MARK
+The current intro.mp4 has PixVerse's free-plan watermark in its top-right corner. PixVerse offers
+watermark-free export on its paid plans, and a paid course app should use a clean copy. When you have
+one, replace the file as described above. Nothing else needs to change.
+
+HOW THE LIVE COUNT WORKS
+Every open tab pings the server every 30 seconds. Someone counts for 75 seconds after their last
+ping. A hidden tab or a phone put down drops off within about a minute. You are not counted (so you
+do not inflate it). To test it, open the app in a private window WITHOUT signing in: you appear as
+a visitor. Or tap "Count me too" in the Live section.
+
+ABOUT THE COST NUMBERS
+They are estimates. OpenAI is counted from tokens at the public price list, so compare with
+platform.openai.com now and then. Render, Supabase and Resend use the plans you enter. Paystack's
+fee is estimated from the rates under Plans.
+The "what if" slider assumes about 30 cents of AI per active student a month until you have 10
+active students; after that it uses what your real students actually cost.
+
+REFUNDS
+Refund in the Paystack dashboard. The app does not take the track back automatically, so tell the
+student, and ask me if you want that automated.
+
+IF SOMETHING LOOKS WRONG
+- No green button: the OWNER_EMAILS value must match the email you sign in with exactly (capitals
+  do not matter). Render restarts after you change it.
+- "A Paystack payment had a problem": the student paid but something did not match (amount,
+  currency or email), or Paystack refused to start a payment (usually a wrong key). The warning
+  says which. If a student really paid, check it in your Paystack dashboard and use "Give a track"
+  in the Control Room.
+- "Students cannot pay": PAYSTACK_SECRET_KEY is missing, or it is the public key (pk_...). Use the
+  secret key (sk_live_...).
+- A student paid, came back, and the course did not open: wait a minute and refresh. The webhook
+  finishes it. If the course is still locked after 5 minutes, check Setup check for the webhook tick.
+- A foreign card is declined: international payments are not approved yet in Paystack (Step 3B).
+- Payments that are already in your database still count as revenue.
